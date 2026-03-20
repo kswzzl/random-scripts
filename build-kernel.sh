@@ -3,13 +3,19 @@
 # build-kernel.sh — Build an up-to-date Linux guest kernel for cloud-hypervisor
 #
 # Uses the ch_defconfig from cloud-hypervisor/linux as a base config, applied to
-# the latest upstream stable kernel from kernel.org. This lets you stay current
-# on security patches without waiting for cloud-hypervisor to cut a release.
+# an upstream stable kernel. This lets you stay current on security patches
+# without waiting for cloud-hypervisor to cut a release.
+#
+# All inputs are expected locally — no network access required at build time.
+# Pre-download these into .cloud-hypervisor/kernel-build/sources/:
+#
+#   linux-<version>.tar.xz   — from https://cdn.kernel.org/pub/linux/kernel/
+#   ch_defconfig              — from cloud-hypervisor/linux arch/x86/configs/
+#   hardening.config          — from cloud-hypervisor/linux arch/x86/configs/
 #
 # Usage:
-#   bash build-kernel.sh                  # auto-detect latest stable kernel
-#   bash build-kernel.sh 6.19.9           # build a specific version
-#   JOBS=4 bash build-kernel.sh           # control parallelism
+#   bash build-kernel.sh 6.19.9           # build from local sources
+#   JOBS=4 bash build-kernel.sh 6.19.9    # control parallelism
 #
 set -euo pipefail
 
@@ -17,42 +23,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CH_DIR="${SCRIPT_DIR}/.cloud-hypervisor"
 KERNEL_DIR="${CH_DIR}/kernel"
 BUILD_DIR="${CH_DIR}/kernel-build"
-
-# cloud-hypervisor/linux branch to pull defconfig from (update when they rebase)
-CH_LINUX_BRANCH="ch-6.16.9"
-CH_LINUX_RAW="https://raw.githubusercontent.com/cloud-hypervisor/linux/${CH_LINUX_BRANCH}"
+SOURCES_DIR="${BUILD_DIR}/sources"
 
 JOBS="${JOBS:-$(nproc)}"
 
 # --------------------------------------------------------------------------- #
 # Resolve kernel version
 # --------------------------------------------------------------------------- #
-resolve_latest_stable() {
-    # kernel.org exposes a JSON endpoint with all releases
-    local latest
-    latest=$(curl -fsSL https://www.kernel.org/releases.json \
-        | grep -Po '"version"\s*:\s*"\K[0-9]+\.[0-9]+\.[0-9]+' \
-        | head -1)
-    if [[ -z "$latest" ]]; then
-        echo "ERROR: Could not determine latest stable kernel version." >&2
-        exit 1
-    fi
-    echo "$latest"
-}
-
-if [[ $# -ge 1 ]]; then
-    KERNEL_VERSION="$1"
-else
-    echo "Querying kernel.org for latest stable version..."
-    KERNEL_VERSION=$(resolve_latest_stable)
+if [[ $# -lt 1 ]]; then
+    echo "Usage: bash build-kernel.sh <kernel-version>"
+    echo ""
+    echo "Example: bash build-kernel.sh 6.19.9"
+    echo ""
+    echo "Place these files in ${SOURCES_DIR}/ before running:"
+    echo "  linux-<version>.tar.xz   (kernel source tarball)"
+    echo "  ch_defconfig             (cloud-hypervisor kernel config)"
+    echo "  hardening.config         (cloud-hypervisor hardening options)"
+    exit 1
 fi
 
-MAJOR_VERSION="${KERNEL_VERSION%%.*}"
-TARBALL_URL="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR_VERSION}.x/linux-${KERNEL_VERSION}.tar.xz"
+KERNEL_VERSION="$1"
 
 echo "=== Cloud Hypervisor Kernel Builder ==="
 echo "  Kernel version:  ${KERNEL_VERSION}"
-echo "  CH defconfig:    ${CH_LINUX_BRANCH}"
+echo "  Sources dir:     ${SOURCES_DIR}"
 echo "  Build jobs:      ${JOBS}"
 echo ""
 
@@ -60,14 +54,12 @@ echo ""
 # Prerequisites check
 # --------------------------------------------------------------------------- #
 missing=()
-for cmd in make gcc flex bison bc curl xz; do
+for cmd in make gcc flex bison bc xz; do
     command -v "$cmd" &>/dev/null || missing+=("$cmd")
 done
-# Check for libelf headers (needed for CONFIG_OBJTOOL)
 if ! pkg-config --exists libelf 2>/dev/null && [[ ! -f /usr/include/libelf.h ]]; then
     missing+=("libelf-dev")
 fi
-# Check for libssl headers (needed for CONFIG_MODULE_SIG / cert gen)
 if ! pkg-config --exists openssl 2>/dev/null && [[ ! -f /usr/include/openssl/ssl.h ]]; then
     missing+=("libssl-dev")
 fi
@@ -84,44 +76,55 @@ if [[ ${#missing[@]} -gt 0 ]]; then
 fi
 
 # --------------------------------------------------------------------------- #
-# Download & extract kernel source
+# Verify local sources exist
 # --------------------------------------------------------------------------- #
-mkdir -p "${BUILD_DIR}"
+TARBALL="${SOURCES_DIR}/linux-${KERNEL_VERSION}.tar.xz"
+DEFCONFIG="${SOURCES_DIR}/ch_defconfig"
+HARDENING_CFG="${SOURCES_DIR}/hardening.config"
+
+err=0
+for f in "${TARBALL}" "${DEFCONFIG}" "${HARDENING_CFG}"; do
+    if [[ ! -f "$f" ]]; then
+        echo "ERROR: Missing: $f" >&2
+        err=1
+    fi
+done
+if [[ $err -ne 0 ]]; then
+    echo "" >&2
+    echo "Download these files on a machine with internet access:" >&2
+    echo "  Kernel:   https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_VERSION%%.*}.x/linux-${KERNEL_VERSION}.tar.xz" >&2
+    echo "  Config:   https://raw.githubusercontent.com/cloud-hypervisor/linux/ch-6.16.9/arch/x86/configs/ch_defconfig" >&2
+    echo "  Harden:   https://raw.githubusercontent.com/cloud-hypervisor/linux/ch-6.16.9/arch/x86/configs/hardening.config" >&2
+    echo "" >&2
+    echo "Then place them in: ${SOURCES_DIR}/" >&2
+    exit 1
+fi
+
+# --------------------------------------------------------------------------- #
+# Extract kernel source
+# --------------------------------------------------------------------------- #
 SRC_DIR="${BUILD_DIR}/linux-${KERNEL_VERSION}"
 
 if [[ -d "${SRC_DIR}" ]]; then
     echo "Kernel source already extracted at ${SRC_DIR}"
 else
-    TARBALL="${BUILD_DIR}/linux-${KERNEL_VERSION}.tar.xz"
-    if [[ -f "${TARBALL}" ]]; then
-        echo "Tarball already downloaded."
-    else
-        echo "Downloading linux-${KERNEL_VERSION}.tar.xz ..."
-        curl -fSL -o "${TARBALL}" "${TARBALL_URL}"
-    fi
-    echo "Extracting..."
+    echo "Extracting linux-${KERNEL_VERSION}.tar.xz ..."
     tar -xf "${TARBALL}" -C "${BUILD_DIR}"
-    rm -f "${TARBALL}"
 fi
 
 # --------------------------------------------------------------------------- #
-# Fetch cloud-hypervisor kernel config
+# Apply cloud-hypervisor kernel config
 # --------------------------------------------------------------------------- #
-echo "Fetching ch_defconfig from cloud-hypervisor/linux (branch: ${CH_LINUX_BRANCH})..."
-curl -fsSL -o "${SRC_DIR}/.config" \
-    "${CH_LINUX_RAW}/arch/x86/configs/ch_defconfig"
+echo "Applying ch_defconfig..."
+cp "${DEFCONFIG}" "${SRC_DIR}/.config"
 
-echo "Fetching hardening.config..."
-HARDENING=$(curl -fsSL "${CH_LINUX_RAW}/arch/x86/configs/hardening.config")
-
-# Merge hardening options into .config
+echo "Merging hardening.config..."
 while IFS= read -r line; do
     [[ "$line" =~ ^CONFIG_ ]] || continue
     key="${line%%=*}"
-    # Remove any existing line for this key, then append the hardening value
     sed -i "/^${key}[= ]/d" "${SRC_DIR}/.config"
     echo "$line" >> "${SRC_DIR}/.config"
-done <<< "$HARDENING"
+done < "${HARDENING_CFG}"
 
 # Resolve any new/missing symbols with defaults
 echo "Running olddefconfig (resolving new config symbols)..."
