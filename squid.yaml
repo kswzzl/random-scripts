@@ -1,0 +1,201 @@
+--- HOW TO UPDATE THE ALLOWLIST ------------------------------------------------
+
+  Option A: Edit the ConfigMap and restart squid
+    kubectl edit configmap -n unit-UNITNAME squid-config
+    kubectl rollout restart -n unit-UNITNAME deployment/squid
+
+  Option B: Replace the whole file
+    (edit the allowed_domains ACL below, then re-apply)
+    kubectl apply -n unit-UNITNAME -f squid.yaml
+    kubectl rollout restart -n unit-UNITNAME deployment/squid
+
+
+--- HOW TO CHECK LOGS ----------------------------------------------------------
+
+  kubectl logs -n unit-UNITNAME -l app=squid -f
+
+  Log format shows: timestamp, response code, domain, method.
+  A blocked request shows TCP_DENIED/403.
+  An allowed CONNECT shows TCP_TUNNEL/200.
+
+
+================================================================================
+ YAML
+================================================================================
+
+# --- Squid configuration -----------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: squid-config
+data:
+  squid.conf: |
+    # ==========================================================================
+    # Squid forward proxy — allowlist mode
+    # ==========================================================================
+
+    # --- Port -----------------------------------------------------------------
+    http_port 3128
+
+    # --- ACLs -----------------------------------------------------------------
+    acl localnet src 10.0.0.0/8
+    acl localnet src 172.16.0.0/12
+    acl localnet src 192.168.0.0/16
+
+    acl SSL_ports port 443
+    acl Safe_ports port 80
+    acl Safe_ports port 443
+    acl CONNECT method CONNECT
+
+    # --- Domain allowlist -----------------------------------------------------
+    # Add one domain per line. Leading dot means "this domain and all subdomains."
+    # Example: .anthropic.com matches api.anthropic.com AND anthropic.com
+    acl allowed_domains dstdomain \
+      .anthropic.com \
+      .openai.com \
+      .googleapis.com \
+      .together.xyz \
+      .groq.com
+
+    # --- Access rules (order matters) -----------------------------------------
+
+    # Block non-standard ports
+    http_access deny !Safe_ports
+
+    # Block CONNECT to non-SSL ports (prevents proxy abuse)
+    http_access deny CONNECT !SSL_ports
+
+    # Allow CONNECT (HTTPS) to allowlisted domains from local pods
+    http_access allow CONNECT localnet allowed_domains
+
+    # Allow plain HTTP to allowlisted domains from local pods
+    http_access allow localnet allowed_domains
+
+    # Deny everything else
+    http_access deny all
+
+    # --- Logging --------------------------------------------------------------
+    # Compact format: timestamp | status | bytes | method | domain
+    logformat compact %tl %Ss/%>Hs %<st %rm %rh %ru
+    access_log stdio:/dev/stdout compact
+    cache_log stdio:/dev/stderr
+
+    # --- Performance ----------------------------------------------------------
+    # No caching — we're a tunnel, not a cache
+    cache deny all
+    maximum_object_size 0 bytes
+
+    # --- DNS ------------------------------------------------------------------
+    # Squid resolves external domains. Uses the host's DNS (via CoreDNS).
+    # No explicit dns_nameservers needed — inherits from /etc/resolv.conf.
+
+    # --- Timeouts -------------------------------------------------------------
+    # LLM API calls can be slow (streaming responses, large contexts).
+    connect_timeout 30 seconds
+    read_timeout 600 seconds
+    request_timeout 600 seconds
+    client_idle_pconn_timeout 120 seconds
+
+    # --- Security hardening ---------------------------------------------------
+    # Don't reveal squid version in error pages or headers
+    httpd_suppress_version_string on
+
+    # Remove forwarded-for header (don't leak internal pod IPs)
+    forwarded_for delete
+
+    # Remove via header
+    via off
+
+    # Disable ICP (inter-cache protocol) — not needed
+    icp_port 0
+
+    # Disable HTCP
+    htcp_port 0
+
+    # Disable SNMP
+    snmp_port 0
+
+    # Limit max request size (prevents abuse)
+    request_body_max_size 100 MB
+
+    # Limit max reply size
+    reply_body_max_size 100 MB all
+
+    # --- PID file -------------------------------------------------------------
+    pid_filename /tmp/squid.pid
+
+    # --- Coredump directory (required by squid) -------------------------------
+    coredump_dir /tmp
+---
+# --- Squid Deployment ---------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: squid
+  labels:
+    app: squid
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: squid
+      role: proxy
+  template:
+    metadata:
+      labels:
+        app: squid
+        role: proxy
+    spec:
+      # Squid is trusted infrastructure — runs on runc, not kata
+      automountServiceAccountToken: false
+      containers:
+      - name: squid
+        image: ubuntu/squid:6.6-24.04_edge
+        ports:
+        - containerPort: 3128
+          protocol: TCP
+        volumeMounts:
+        - name: config
+          mountPath: /etc/squid/squid.conf
+          subPath: squid.conf
+          readOnly: true
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        readinessProbe:
+          tcpSocket:
+            port: 3128
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+        livenessProbe:
+          tcpSocket:
+            port: 3128
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 3
+        securityContext:
+          readOnlyRootFilesystem: false
+          allowPrivilegeEscalation: false
+      volumes:
+      - name: config
+        configMap:
+          name: squid-config
+---
+# --- Squid Service ------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: squid
+spec:
+  selector:
+    app: squid
+    role: proxy
+  ports:
+  - port: 3128
+    targetPort: 3128
+    protocol: TCP
