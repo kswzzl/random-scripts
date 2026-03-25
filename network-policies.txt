@@ -265,3 +265,26 @@ kubectl delete -n unit-UNITNAME pod net-test
 --- CLEANUP (destroy the whole unit) ------------------------------------------
 
 kubectl delete namespace unit-UNITNAME
+
+
+
+--- OPTIONAL ------------------------
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: agent-dns-restrict
+spec:
+  endpointSelector:
+    matchLabels:
+      role: agent
+  egress:
+  - toEndpoints:
+    - matchLabels:
+        k8s-app: kube-dns
+    toPorts:
+    - ports:
+      - port: "53"
+        protocol: ANY
+      rules:
+        dns:
+        - matchPattern: "*.unit-*.svc.cluster.local"
