@@ -23,29 +23,25 @@ EOF
 --- STEP 2: Allow DNS for agents ----------------------------------------------
 --- Without this, pods can't resolve service names like squid.unit-UNITNAME.svc
 
-kubectl apply -n unit-UNITNAME -f - << 'EOF'
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
 metadata:
-  name: agent-allow-dns
+  name: agent-dns-restrict
 spec:
-  podSelector:
+  endpointSelector:
     matchLabels:
       role: agent
-  policyTypes:
-  - Egress
   egress:
-  - to:
-    - namespaceSelector: {}
-      podSelector:
-        matchLabels:
-          k8s-app: kube-dns
-    ports:
-    - port: 53
-      protocol: UDP
-    - port: 53
-      protocol: TCP
-EOF
+  - toEndpoints:
+    - matchLabels:
+        k8s-app: kube-dns
+    toPorts:
+    - ports:
+      - port: "53"
+        protocol: ANY
+      rules:
+        dns:
+        - matchPattern: "*.unit-*.svc.cluster.local"
 
 
 --- STEP 3: Allow agents to reach squid only ----------------------------------
@@ -268,23 +264,3 @@ kubectl delete namespace unit-UNITNAME
 
 
 
---- OPTIONAL ------------------------
-apiVersion: cilium.io/v2
-kind: CiliumNetworkPolicy
-metadata:
-  name: agent-dns-restrict
-spec:
-  endpointSelector:
-    matchLabels:
-      role: agent
-  egress:
-  - toEndpoints:
-    - matchLabels:
-        k8s-app: kube-dns
-    toPorts:
-    - ports:
-      - port: "53"
-        protocol: ANY
-      rules:
-        dns:
-        - matchPattern: "*.unit-*.svc.cluster.local"
