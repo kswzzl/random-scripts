@@ -1,0 +1,227 @@
+================================================================================
+ Agent Fleet — Network Policies (consolidated)
+ Replace UNITNAME throughout. Apply with:
+   kubectl apply -n unit-UNITNAME -f network-policies.yaml
+================================================================================
+
+
+--- POLICY SUMMARY -------------------------------------------------------------
+
+  agent pods (role: agent)
+    CAN  --> squid:3128              via NetworkPolicy
+    CAN  --> mcp-server:8080         via NetworkPolicy
+    CAN  --> kube-dns:53             via CiliumNetworkPolicy
+             only *.svc.cluster.local (no external DNS, no exfil)
+    DENY --> everything else
+
+  squid pods (role: proxy)
+    ACCEPTS <-- agents on 3128       via NetworkPolicy
+    ACCEPTS <-- mcp on 3128          via NetworkPolicy
+    CAN     --> anything             (internet, external DNS, etc.)
+             squid.conf allowlist filters at the HTTP level
+    DENY    <-- everything else
+
+  mcp pods (role: mcp)
+    ACCEPTS <-- agents on 8080       via NetworkPolicy
+    CAN     --> squid:3128           via NetworkPolicy (for outbound tool calls)
+    CAN     --> kube-dns:53          via CiliumNetworkPolicy
+                only *.svc.cluster.local (no external DNS, no exfil)
+    DENY    --> everything else
+
+  any unlabeled pod
+    DENY    --> everything           (caught by default-deny-all)
+
+
+--- REQUIRED POD LABELS --------------------------------------------------------
+
+  Agent pods:     role: agent
+  Squid pods:     role: proxy
+  MCP pods:       role: mcp
+
+
+--- TRAFFIC FLOW ---------------------------------------------------------------
+
+  agent ──3128──> squid ──internet──> api.anthropic.com (filtered by squid.conf)
+  agent ──8080──> mcp
+                  mcp ──3128──> squid ──internet──> (tool calls, filtered)
+  agent ──53────> kube-dns (cluster-internal names only)
+  mcp   ──53────> kube-dns (cluster-internal names only)
+  squid ──53────> kube-dns ──forward──> external DNS (squid needs this)
+
+
+================================================================================
+ YAML — save everything below this line as network-policies.yaml
+================================================================================
+
+# --- 1. Default deny all ingress + egress for every pod ---------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+# --- 2. Agent DNS — cluster-internal only (CiliumNetworkPolicy) -------------
+# Replaces the standard agent-allow-dns. L7 DNS filter prevents exfil.
+# Agents only resolve *.svc.cluster.local. External domains are resolved
+# by squid, not by agents.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: agent-dns-restrict
+spec:
+  endpointSelector:
+    matchLabels:
+      role: agent
+  egress:
+  - toEndpoints:
+    - matchLabels:
+        k8s-app: kube-dns
+        k8s:io.kubernetes.pod.namespace: kube-system
+    toPorts:
+    - ports:
+      - port: "53"
+        protocol: ANY
+      rules:
+        dns:
+        - matchPattern: "*.svc.cluster.local"
+---
+# --- 3. MCP DNS — same restriction as agents --------------------------------
+# MCP resolves squid.unit-UNITNAME.svc.cluster.local and nothing external.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: mcp-dns-restrict
+spec:
+  endpointSelector:
+    matchLabels:
+      role: mcp
+  egress:
+  - toEndpoints:
+    - matchLabels:
+        k8s-app: kube-dns
+        k8s:io.kubernetes.pod.namespace: kube-system
+    toPorts:
+    - ports:
+      - port: "53"
+        protocol: ANY
+      rules:
+        dns:
+        - matchPattern: "*.svc.cluster.local"
+---
+# --- 4. Agent to squid -------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-to-squid
+spec:
+  podSelector:
+    matchLabels:
+      role: agent
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          role: proxy
+    ports:
+    - port: 3128
+      protocol: TCP
+---
+# --- 5. Agent to MCP ---------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-to-mcp
+spec:
+  podSelector:
+    matchLabels:
+      role: agent
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          role: mcp
+    ports:
+    - port: 8080
+      protocol: TCP
+---
+# --- 6. MCP to squid ---------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mcp-to-squid
+spec:
+  podSelector:
+    matchLabels:
+      role: mcp
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          role: proxy
+    ports:
+    - port: 3128
+      protocol: TCP
+---
+# --- 7. Squid policy ---------------------------------------------------------
+# Accepts inbound from agents AND mcp.
+# Unrestricted egress (internet access + external DNS for resolving domains).
+# Squid.conf allowlist handles domain filtering at the HTTP layer.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: squid-policy
+spec:
+  podSelector:
+    matchLabels:
+      role: proxy
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          role: agent
+    ports:
+    - port: 3128
+      protocol: TCP
+  - from:
+    - podSelector:
+        matchLabels:
+          role: mcp
+    ports:
+    - port: 3128
+      protocol: TCP
+  egress:
+  - {}
+---
+# --- 8. MCP ingress ----------------------------------------------------------
+# MCP only accepts connections from agents on 8080. Nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mcp-ingress
+spec:
+  podSelector:
+    matchLabels:
+      role: mcp
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          role: agent
+    ports:
+    - port: 8080
+      protocol: TCP
