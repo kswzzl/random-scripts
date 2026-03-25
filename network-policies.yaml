@@ -1,5 +1,5 @@
 ================================================================================
- Agent Fleet — Network Policies (consolidated)
+ Agent Fleet — Network Policies v2
  Replace UNITNAME throughout. Apply with:
    kubectl apply -n unit-UNITNAME -f network-policies.yaml
 ================================================================================
@@ -8,28 +8,27 @@
 --- POLICY SUMMARY -------------------------------------------------------------
 
   agent pods (role: agent)
-    CAN  --> squid:3128              via NetworkPolicy
-    CAN  --> mcp-server:8080         via NetworkPolicy
-    CAN  --> kube-dns:53             via CiliumNetworkPolicy
-             only *.svc.cluster.local (no external DNS, no exfil)
-    DENY --> everything else
+    CAN  --> squid:3128              policy: agent-egress
+    CAN  --> mcp-server:8080         policy: agent-egress
+    CAN  --> kube-dns:53             policy: dns-restrict
+             only *.svc.cluster.local
+    DENY --> everything else         policy: default-deny-all
 
   squid pods (role: proxy)
-    ACCEPTS <-- agents on 3128       via NetworkPolicy
-    ACCEPTS <-- mcp on 3128          via NetworkPolicy
-    CAN     --> anything             (internet, external DNS, etc.)
-             squid.conf allowlist filters at the HTTP level
-    DENY    <-- everything else
+    ACCEPTS <-- agents on 3128       policy: squid-policy
+    ACCEPTS <-- mcp on 3128          policy: squid-policy
+    CAN     --> anything             policy: squid-policy
+    DENY    <-- everything else      policy: default-deny-all
 
   mcp pods (role: mcp)
-    ACCEPTS <-- agents on 8080       via NetworkPolicy
-    CAN     --> squid:3128           via NetworkPolicy (for outbound tool calls)
-    CAN     --> kube-dns:53          via CiliumNetworkPolicy
-                only *.svc.cluster.local (no external DNS, no exfil)
-    DENY    --> everything else
+    ACCEPTS <-- agents on 8080       policy: mcp-policy
+    CAN     --> squid:3128           policy: mcp-egress
+    CAN     --> kube-dns:53          policy: dns-restrict
+                only *.svc.cluster.local
+    DENY    --> everything else      policy: default-deny-all
 
   any unlabeled pod
-    DENY    --> everything           (caught by default-deny-all)
+    DENY    --> everything           policy: default-deny-all
 
 
 --- REQUIRED POD LABELS --------------------------------------------------------
@@ -64,18 +63,22 @@ spec:
   - Ingress
   - Egress
 ---
-# --- 2. Agent DNS — cluster-internal only (CiliumNetworkPolicy) -------------
-# Replaces the standard agent-allow-dns. L7 DNS filter prevents exfil.
-# Agents only resolve *.svc.cluster.local. External domains are resolved
-# by squid, not by agents.
+# --- 2. DNS restrict for agents and MCP (CiliumNetworkPolicy) ---------------
+# Both agents and MCP can only resolve *.svc.cluster.local.
+# No external DNS queries, no DNS exfil path.
+# External domain resolution is handled by squid, not by agents or MCP.
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
-  name: agent-dns-restrict
+  name: dns-restrict
 spec:
   endpointSelector:
-    matchLabels:
-      role: agent
+    matchExpressions:
+    - key: role
+      operator: In
+      values:
+      - agent
+      - mcp
   egress:
   - toEndpoints:
     - matchLabels:
@@ -89,34 +92,11 @@ spec:
         dns:
         - matchPattern: "*.svc.cluster.local"
 ---
-# --- 3. MCP DNS — same restriction as agents --------------------------------
-# MCP resolves squid.unit-UNITNAME.svc.cluster.local and nothing external.
-apiVersion: cilium.io/v2
-kind: CiliumNetworkPolicy
-metadata:
-  name: mcp-dns-restrict
-spec:
-  endpointSelector:
-    matchLabels:
-      role: mcp
-  egress:
-  - toEndpoints:
-    - matchLabels:
-        k8s-app: kube-dns
-        k8s:io.kubernetes.pod.namespace: kube-system
-    toPorts:
-    - ports:
-      - port: "53"
-        protocol: ANY
-      rules:
-        dns:
-        - matchPattern: "*.svc.cluster.local"
----
-# --- 4. Agent to squid -------------------------------------------------------
+# --- 3. Agent egress — squid + MCP only -------------------------------------
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: agent-to-squid
+  name: agent-egress
 spec:
   podSelector:
     matchLabels:
@@ -131,19 +111,6 @@ spec:
     ports:
     - port: 3128
       protocol: TCP
----
-# --- 5. Agent to MCP ---------------------------------------------------------
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: agent-to-mcp
-spec:
-  podSelector:
-    matchLabels:
-      role: agent
-  policyTypes:
-  - Egress
-  egress:
   - to:
     - podSelector:
         matchLabels:
@@ -152,11 +119,11 @@ spec:
     - port: 8080
       protocol: TCP
 ---
-# --- 6. MCP to squid ---------------------------------------------------------
+# --- 4. MCP egress — squid only ---------------------------------------------
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: mcp-to-squid
+  name: mcp-egress
 spec:
   podSelector:
     matchLabels:
@@ -172,9 +139,7 @@ spec:
     - port: 3128
       protocol: TCP
 ---
-# --- 7. Squid policy ---------------------------------------------------------
-# Accepts inbound from agents AND mcp.
-# Unrestricted egress (internet access + external DNS for resolving domains).
+# --- 5. Squid policy — accepts from agents + MCP, unrestricted egress -------
 # Squid.conf allowlist handles domain filtering at the HTTP layer.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -205,12 +170,11 @@ spec:
   egress:
   - {}
 ---
-# --- 8. MCP ingress ----------------------------------------------------------
-# MCP only accepts connections from agents on 8080. Nothing else.
+# --- 6. MCP ingress — accepts from agents only ------------------------------
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: mcp-ingress
+  name: mcp-policy
 spec:
   podSelector:
     matchLabels:
