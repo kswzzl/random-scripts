@@ -35,13 +35,15 @@ spec:
   - toEndpoints:
     - matchLabels:
         k8s-app: kube-dns
+        k8s:io.kubernetes.pod.namespace: kube-system
     toPorts:
     - ports:
       - port: "53"
         protocol: ANY
       rules:
         dns:
-        - matchPattern: "*.unit-*.svc.cluster.local"
+        - matchPattern: "*.svc.cluster.local"
+        - matchPattern: "www.google.com"
 
 
 --- STEP 3: Allow agents to reach squid only ----------------------------------
