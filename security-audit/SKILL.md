@@ -1,12 +1,14 @@
 ---
 name: security-audit
 description: >-
-  Security audit of a codebase. Three phases: (1) Semgrep scan using bundled
+  Security audit of a codebase. Five phases: (1) Semgrep scan using bundled
   offline rules, (2) triage semgrep findings by reading the actual source to
-  classify true/false positives, (3) general code review for bugs semgrep
-  can't catch — logic flaws, auth issues, race conditions, etc. Phases can
-  be run individually or together. Use when asked to audit code, find
-  vulnerabilities, review security, do static analysis, or scan for bugs.
+  classify true/false positives, (3) manual code review for bugs semgrep
+  can't catch, (4) proof-of-bug via build + sanitizers + patch oracle for
+  high-confidence findings, (5) final report consolidation + variant
+  documentation. Each phase produces its own artifact. Phases can be run
+  individually or together. Use when asked to audit code, find vulnerabilities,
+  review security, do static analysis, or scan for bugs.
 allowed-tools:
   - Bash
   - Read
@@ -16,7 +18,21 @@ allowed-tools:
 
 # Security Audit
 
-Three-phase security review: automated scan, triage, manual code review. Each phase builds on the previous one's output but can be run standalone.
+Five-phase security review: automated scan → triage → manual code review → proof-of-bug → final report. Each phase builds on the previous one's output but can be run standalone. Each phase produces its own artifact — no phase edits another phase's output. Every finding carries an **evidence level** that tracks how far it has been validated.
+
+## Evidence Levels
+
+Every finding is tagged with an evidence level. Higher levels subsume lower ones — a `crash_reproduced` finding was necessarily `static_corroboration` first.
+
+| Level | Meaning | Set by |
+|---|---|---|
+| `pattern_match` | A semgrep rule fired on this code | Phase 1 |
+| `suspicion` | Looks wrong but data flow not fully traced | Phase 2 or 3 |
+| `static_corroboration` | Data flow traced end-to-end in source; high confidence it's real | Phase 2 or 3 |
+| `crash_reproduced` | A test/PoC triggers the bug under sanitizers or the project's own test harness | Phase 4 |
+| `patch_validated` | A minimal fix was applied, the PoC re-ran, and the crash/error is gone — causal proof | Phase 4 |
+
+Phase 4 attempts to promote `static_corroboration` findings to `crash_reproduced` or `patch_validated`. If it can't (build fails, no sanitizer available, language doesn't support it), the finding stays at `static_corroboration` with a note explaining what was attempted.
 
 ## Invocation Options
 
@@ -29,24 +45,51 @@ Detect these from the user's prompt — no formal parser.
 | `review only`, `code review only`, `phase 3` | Run Phase 3 only (skip semgrep) |
 | `triage`, `scan and triage`, `phases 1-2` | Run Phases 1 + 2 |
 | `all bugs`, `all findings`, `no filter`, `include low`, `noisy` | Disable the default importance filter — report everything, including low-confidence and non-security findings |
+| `include tests`, `audit tests` | Disable the default test-code exclusion (normally tests are ignored in all phases) |
+| `include vendor`, `audit vendor`, `audit third-party` | Disable the default vendor/dep exclusion (normally vendored and third-party code is ignored) |
+| `prove`, `proof`, `with proof`, `confirm bugs` | Run Phase 4 (proof-of-bug) after code review |
+| `variants`, `variant analysis` | Run Phase 5 (final report + variant documentation) |
+| `full pipeline`, `everything` | Run all five phases |
 | `output to <dir>`, `into <dir>` | Custom output directory |
 
-**Default (no flags):** all three phases, **important-only mode** (severity + metadata filter on Phase 1, ≥80% confidence on Phase 3, high-value true positives only on Phase 2). Output dir = `./security_audit_N` (auto-incremented).
+**Default (no flags):** Phases 1-3 only, **important-only mode** (severity + metadata filter on Phase 1, ≥80% confidence on Phase 3, high-value true positives only on Phase 2). Output dir = `./security_audit_N` (auto-incremented). Phases 4-5 require explicit opt-in (`prove`, `variants`, or `full pipeline`).
 
 **Important-only is the default across all phases** because noise defeats the point of the skill. Users who want the full unfiltered output must explicitly opt in with `all bugs` or equivalent.
 
 ## Output
 
-All output goes to `$OUTPUT_DIR`:
+All output goes to `$OUTPUT_DIR`. The skill mirrors the scanned directory's layout under `$OUTPUT_DIR` so that (a) multiple targets can share one output dir without collision, and (b) artifact paths stay meaningful when the repo moves.
+
+**Mirror rule:** given TARGET, strip one of the well-known host prefixes (`/home/<user>/`, `/Users/<user>/`, `/workspace/`, `/root/`, `/tmp/`, `/var/www/`, `/opt/`) to produce `MIRRORED_SUBPATH`. If none match, fall back to `basename(TARGET)`. All artifacts for this scan go under `$OUTPUT_DIR/$MIRRORED_SUBPATH/`.
+
+Examples:
+- TARGET `/home/user/foo/bar` → `$OUTPUT_DIR/foo/bar/…`
+- TARGET `/workspace/blah/baz` → `$OUTPUT_DIR/blah/baz/…`
+- TARGET `/opt/projects/xyz` → `$OUTPUT_DIR/projects/xyz/…`
+
+Per-target artifact layout:
 
 ```
-$OUTPUT_DIR/
+$OUTPUT_DIR/<MIRRORED_SUBPATH>/
 ├── semgrep/              # Phase 1: raw semgrep JSON per ruleset
+│   ├── <lang>-<rule>.json
+│   ├── <lang>-<rule>-important.json
+│   └── parse-failures.txt # files semgrep couldn't parse (Phase 1f)
 ├── triage.md             # Phase 2: finding-by-finding triage
-└── audit.md              # Final consolidated report (Phase 3)
+├── review.md             # Phase 3: manual code review findings
+├── proof/                # Phase 4: proof-of-bug artifacts (if run)
+│   ├── proof.md          # summary table + per-finding notes
+│   ├── build.log         # build system detection + compile output
+│   ├── poc_N.c           # PoC source for finding N
+│   ├── poc_N_output.txt  # sanitizer/crash output
+│   ├── patch_N.diff      # minimal fix for finding N
+│   └── poc_N_patched_output.txt  # re-run after patch
+└── report.md             # Phase 5: final consolidated report + variant patterns
 ```
 
-A short chat summary is printed at the end. The full report is in `audit.md`.
+**One artifact per phase.** Each phase writes its own file and never edits another phase's output. Phase 5 (`report.md`) is the authoritative final report — it synthesizes findings from phases 2-4, applies final evidence levels, and appends variant documentation. Earlier artifacts (`triage.md`, `review.md`, `proof/proof.md`) are working documents that remain frozen at the state they were written.
+
+A short chat summary is printed at the end. The full report is in `report.md`.
 
 ---
 
@@ -59,21 +102,69 @@ Automated pattern-match scan using locally bundled rules. No network, no Pro, no
 1. **Always pass `--metrics=off`.**
 2. **Only use rule directories under `{baseDir}/rules/`.** Never `--config p/...`, never `--config auto`, never a URL, never `git clone`.
 3. **Never pass `--pro`.**
+4. **Never install semgrep yourself.** If `command -v semgrep` fails, **error out immediately** with an install hint. Do not run `brew install`, `pipx install`, `pip install`, `apt`, `uv tool install`, or any equivalent — installing tooling is explicitly out of scope for this skill.
+5. **Always ignore tests.** Test files, test directories, mocks, fixtures, benchmarks, and examples are excluded by default from every phase. Findings in test code are not reported. The default exclude list is in step 1d; users who explicitly want to audit tests must say `include tests`.
+6. **Never silently skip a file.** If semgrep fails to parse a source file, record it in `parse-failures.txt` and surface it to the user. Phase 3 then prioritizes these files for manual review. No coverage gaps, anywhere.
 
 ### Steps
 
-**1a. Resolve output dir and verify semgrep:**
+**1a. Resolve output dir, mirror path, and verify semgrep:**
 
 ```bash
+# Output dir
 if [ -n "$USER_SPECIFIED_DIR" ]; then
   OUTPUT_DIR="$USER_SPECIFIED_DIR"
 else
   N=1; while [ -e "security_audit_$N" ]; do N=$((N+1)); done
   OUTPUT_DIR="security_audit_$N"
 fi
-mkdir -p "$OUTPUT_DIR/semgrep"
-command -v semgrep >/dev/null || { echo "ERROR: semgrep not installed"; exit 1; }
+
+# Mirror path under OUTPUT_DIR that reflects TARGET's location.
+# Tries both the original path (as the user typed it) and the canonicalized
+# path (pwd -P), because symlinks like /tmp → /private/tmp on macOS would
+# otherwise hide all the meaningful prefixes. Regex prefixes handle any user
+# for home dirs (not just the current $USER).
+_mirror_path() {
+  local orig="$1" canon stripped
+  canon=$(cd "$orig" 2>/dev/null && pwd -P)
+  [ -z "$canon" ] && canon="$orig"
+  for t in "$orig" "$canon"; do
+    # Strip the first matching prefix (order matters — most specific first).
+    stripped=$(printf '%s' "$t" | sed -E 's,^/(home|Users)/[^/]+/,,; t out
+      s,^/private/tmp/,,; t out
+      s,^/tmp/,,; t out
+      s,^/workspace/,,; t out
+      s,^/root/,,; t out
+      s,^/(private/)?var/www/,,; t out
+      s,^/opt/,,; t out
+      d
+      :out')
+    if [ -n "$stripped" ] && [ "$stripped" != "$t" ]; then
+      echo "$stripped"
+      return
+    fi
+  done
+  basename "$canon"
+}
+MIRRORED_SUBPATH=$(_mirror_path "$TARGET")
+MIRRORED="$OUTPUT_DIR/$MIRRORED_SUBPATH"
+mkdir -p "$MIRRORED/semgrep"
+
+# Semgrep must already be installed. NEVER attempt to install it.
+if ! command -v semgrep >/dev/null; then
+  cat >&2 <<'ERR'
+ERROR: semgrep is not installed.
+This skill will NOT install it for you. Install manually, then re-run:
+  brew install semgrep          # macOS
+  pipx install semgrep          # any OS with pipx
+  python3 -m pip install semgrep
+Then verify with: semgrep --version
+ERR
+  exit 1
+fi
 ```
+
+All subsequent steps write under `$MIRRORED` (e.g. `$MIRRORED/semgrep/*.json`, `$MIRRORED/triage.md`, `$MIRRORED/review.md`), not `$OUTPUT_DIR` directly.
 
 **1b. Detect languages** using Glob (not Bash):
 
@@ -105,11 +196,31 @@ BASE=/abs/path/to/skill   # {baseDir}
 # Default is important-only; set SEV=() if user explicitly requested "all bugs"
 SEV=(--severity WARNING --severity ERROR)
 
+# Default excludes. Always applied unless the user said `include tests` / `include vendor`.
+# Test/benchmark/fixture directories and files — we never report findings in these.
+EXCLUDES=(
+  --exclude=tests --exclude=test --exclude=testing
+  --exclude=__tests__ --exclude=__test__ --exclude=spec --exclude=specs
+  --exclude=mocks --exclude=mock --exclude=fixtures --exclude=testdata
+  --exclude=benchmarks --exclude=benchmark --exclude=bench
+  --exclude=examples --exclude=example --exclude=samples
+  --exclude='*_test.go' --exclude='*_test.py' --exclude='*_test.c' --exclude='*_test.cc' --exclude='*_test.cpp'
+  --exclude='test_*.py' --exclude='test_*.c' --exclude='test_*.cpp'
+  --exclude='*.test.js' --exclude='*.test.ts' --exclude='*.test.jsx' --exclude='*.test.tsx'
+  --exclude='*.spec.js' --exclude='*.spec.ts'
+  --exclude='*.tests.cs' --exclude='*Tests.cs'
+  # Vendored / build / deps — noise that's not ours to audit
+  --exclude=vendor --exclude=third_party --exclude=third-party --exclude=deps
+  --exclude=node_modules --exclude=build --exclude='cmake-build*'
+  --exclude=.git --exclude=.svn --exclude=.hg
+  --exclude=target --exclude=dist --exclude=.next
+)
+
 run() {
   local dir="$1" name="$2"; shift 2
-  semgrep --metrics=off --quiet "${SEV[@]}" "$@" \
-    --config "$dir" --json -o "$OUTPUT_DIR/semgrep/$name.json" \
-    "$TARGET" 2>"$OUTPUT_DIR/semgrep/$name.stderr"
+  semgrep --metrics=off --quiet "${SEV[@]}" "${EXCLUDES[@]}" "$@" \
+    --config "$dir" --json -o "$MIRRORED/semgrep/$name.json" \
+    "$TARGET" 2>"$MIRRORED/semgrep/$name.stderr"
 }
 
 run "$BASE/rules/semgrep-rules/python/lang"   python-lang   --include='*.py' &
@@ -123,12 +234,13 @@ wait
 - `--include` only on language-specific directories. Cross-language dirs get none.
 - `--severity` only accepts `INFO`, `WARNING`, `ERROR`. Not `LOW`/`MEDIUM`/`HIGH`/`CRITICAL` — those are JSON metadata, not CLI values.
 - Each `--severity` flag must be a **separate shell token**, not one quoted string.
-- With `--quiet`, real errors land in the JSON's `errors[]` array (not stderr). Check `jq '.errors' "$OUTPUT_DIR/semgrep/$name.json"` per-ruleset; a non-empty array means the scan failed.
+- With `--quiet`, real errors land in the JSON's `errors[]` array (not stderr). Check `jq '.errors' "$MIRRORED/semgrep/$name.json"` per-ruleset.
+- Default `EXCLUDES` ignore tests, vendored code, and build artifacts. If user invoked with `include tests`, drop the test-related `--exclude` entries. `include vendor` drops the vendor/deps entries.
 
 **1e. Post-filter (default; skip only if user asked for all bugs):**
 
 ```bash
-for f in "$OUTPUT_DIR/semgrep"/*.json; do
+for f in "$MIRRORED/semgrep"/*.json; do
   [[ "$f" == *-important.json ]] && continue
   jq '{
     results: [.results[] |
@@ -144,6 +256,26 @@ for f in "$OUTPUT_DIR/semgrep"/*.json; do
 done
 ```
 
+**1f. Extract parse failures — always.** Semgrep silently skips files it cannot parse (common for modern C++, heavy templates, macro-heavy code). Coverage gaps must be made visible to the user AND routed to Phase 3.
+
+```bash
+# Collect unique files that any ruleset failed to parse.
+# Semgrep uses several error types for this; catch all of them.
+jq -r '.errors[]? | select(
+         (.type // "") | test("(?i)syntax|parse|lexical|timeout|partial parse")
+       ) | (.location.path // .path // empty)' \
+  "$MIRRORED/semgrep"/*.json 2>/dev/null \
+  | sort -u > "$MIRRORED/semgrep/parse-failures.txt"
+
+PARSE_FAIL_COUNT=$(wc -l < "$MIRRORED/semgrep/parse-failures.txt" | tr -d ' ')
+if [ "$PARSE_FAIL_COUNT" -gt 0 ]; then
+  echo "WARNING: semgrep could not parse $PARSE_FAIL_COUNT file(s). See $MIRRORED/semgrep/parse-failures.txt"
+  echo "These files will be prioritized for manual review in Phase 3."
+fi
+```
+
+This file is a first-class input to Phase 3 — not just a diagnostic. Every listed file MUST be covered by Phase 3, no exceptions.
+
 ---
 
 ## Phase 2: Triage Semgrep Findings
@@ -152,34 +284,52 @@ Read each semgrep finding, look at the actual source code in context, and classi
 
 ### For each finding:
 
-1. **Read the finding** from the JSON: rule ID, message, file path, line range.
-2. **Read the source** at that location (use Read with enough surrounding context — typically ±20 lines).
-3. **Classify:**
-   - **True positive** — real bug, exploitable or clearly wrong. Note severity and exploitability.
-   - **Likely true positive** — looks real but needs deeper context to confirm (e.g., depends on caller).
-   - **False positive** — explain why (constant input, dead code, already validated, etc.).
-4. **For true positives**, note: what's the impact? How would an attacker reach this? What's the fix?
+1. **Skip test findings.** If the finding's file path matches any test pattern (path contains `test`, `tests`, `spec`, `mocks`, `fixtures`, `testdata`, `benchmark`, `examples`; or basename matches `test_*`, `*_test.*`, `*.test.*`, `*.spec.*`), skip it silently. We don't report bugs in test code.
+2. **Read the finding** from the JSON: rule ID, message, file path, line range.
+3. **Read the source** at that location (use Read with enough surrounding context — typically ±20 lines).
+4. **Classify into one of four buckets.** Every finding lands in exactly one:
+
+   - **Exploitable** — attacker-controlled input reaches a dangerous operation; data flow traced end-to-end. Fix now.
+   - **Defect** — a real bug in the code (UAF, OOB, strcpy, off-by-one, null deref, unchecked allocation, format-string, etc.). Exploitability depends on callers. We may have traced some reachability in this scan, but reviewers cannot enumerate every consumer of a function — especially in monorepos, libraries, or code that may be reused in future. Report the bug; note what we did and didn't verify about reachability. The downstream reader decides what reachability means for them.
+   - **Quality / correctness** — brittle code, fragile pattern, defense-in-depth gap. Not a concrete bug today but a future bug if the code evolves.
+   - **False positive** — rule misfired. Explain why (constant input, unreachable code, already validated, different bug class than rule claims).
+
+5. **For exploitable findings**, note: what's the impact? How would an attacker reach this? What's the fix?
+
+Note: a pure crash (null deref, divide-by-zero, allocation-failure not checked) is a **defect**, not a separate bucket. If the crash is triggered by attacker-controlled input on a long-running process, reclassify as exploitable (single-request daemon crashes are real DoS, independent of the DoS exclusion policy which applies to resource-exhaustion noise). Whether a defect is "exploitable today" depends on caller context we may not see — err on the side of reporting it as a defect with an honest caveat.
 
 ### Output
 
-Write `$OUTPUT_DIR/triage.md`:
+Write `$MIRRORED/triage.md` with **all four buckets**, even when they are empty — keeps the artifact structure stable for follow-on questions:
 
 ```markdown
 # Semgrep Triage
 
-## True Positives
+## Exploitable
 
 ### [HIGH] SQL injection in `src/db.py:42`
 - **Rule:** python.lang.security.audit.formatted-sql-query
-- **Finding:** User input concatenated into SQL query
-- **Verdict:** True positive. `name` parameter comes from HTTP request (line 38) and reaches query unsanitized.
+- **Verdict:** Exploitable. `name` parameter comes from HTTP request (src/api.py:38) and reaches query unsanitized.
+- **Evidence:** `static_corroboration`
 - **Impact:** Full database read/write via crafted input.
 - **Fix:** Use parameterized query.
 
-### [MEDIUM] ...
+## Defects
 
-## Likely True Positives
-...
+### `src/util.c:103` — use of `gets()`
+- **Verdict:** Defect. `gets` is unsafe and unbounded. In this scan's scope, the only caller is an internal self-test passing a constant. Reachability from attacker input in other contexts (other services in this monorepo, downstream library consumers, future refactors) was not verified.
+- **Evidence:** `pattern_match`
+- **Fix:** replace with `fgets(buf, sizeof(buf), stdin)`.
+
+### `src/parser.c:218` — null deref on malformed config
+- **Verdict:** Defect. `strchr` return not checked before deref. Crashes the process on malformed input. In this scan's scope, config is read at startup from a root-owned path; we did not verify that every deployment uses that path. If the config path becomes attacker-writable (e.g. different deployment, shared-hosting), this becomes a crash-on-demand.
+- **Evidence:** `static_corroboration`
+- **Fix:** check for NULL before deref; return a parse error.
+
+## Quality / Correctness
+
+### `src/net.c:92` — missing errno check after recv()
+- **Verdict:** `recv()` return value used without checking for -1. On transient network error, produces garbage bytes in the buffer. Not a concrete bug today (garbage stays within bounds), but defensively wrong.
 
 ## False Positives
 
@@ -187,9 +337,9 @@ Write `$OUTPUT_DIR/triage.md`:
 - **Verdict:** False positive. MD5 used for non-security cache key, not authentication.
 ```
 
-**Default is important-only.** Phase 2 should triage against the `*-important.json` files from Phase 1's post-filter (not the raw `.json` files). Report only the true positives and likely-TPs that survive the filter; do not pad the triage with INFO-severity or low-confidence findings unless the user explicitly asked for `all bugs`.
+**Default is important-only.** Triage against the `*-important.json` files from Phase 1's post-filter (not the raw `.json`). The five-bucket structure still applies — important-only filters what **enters** triage, not what bucket a finding lands in.
 
-If the user **did** ask for `all bugs`, triage the full raw JSON. Prioritize: work through ERROR severity first, then WARNING, then INFO. If there are many findings (>50), triage ERRORs and WARNINGs fully, then sample INFOs.
+If the user **did** ask for `all bugs`, triage the full raw JSON. Prioritize ERROR → WARNING → INFO severity. If there are many findings (>50), triage ERRORs and WARNINGs fully, then sample INFOs.
 
 ---
 
@@ -210,6 +360,10 @@ You are a senior security engineer auditing this codebase for exploitable vulner
 - What are the entry points for untrusted input? (HTTP handlers, CLI args, file readers, socket listeners, deserialization, IPC, env vars)
 - What are the privileged sinks? (exec, SQL, file writes, auth decisions, crypto operations, memory allocation with external sizes)
 - What's the trust boundary? Where does the code decide "this input is now safe"?
+
+**Priority input (if Phase 1 ran):** read `$MIRRORED/semgrep/parse-failures.txt`. Every file listed there was skipped by the scanner — semgrep has **zero coverage** on those files. They MUST be reviewed in this phase regardless of how you prioritize elsewhere. Parse-failing files tend to be macro-heavy or use modern C++ — exactly the kind of code where subtle bugs hide. Treat them as first-class audit targets.
+
+**Always ignore test code.** Skip any file whose path contains `test`, `tests`, `spec`, `mocks`, `fixtures`, `testdata`, `benchmark`, `examples`; or whose basename matches `test_*`, `*_test.*`, `*.test.*`, `*.spec.*`. Findings in test code are not reported. The only exception is `include tests` invocation.
 
 **B. Form hypotheses, then verify.** This is a ReAct loop: *hypothesize → read related code → confirm or discard*. Don't report a hypothesis as a finding until you've actually traced the data flow.
 
@@ -297,12 +451,13 @@ These are noise at this layer. Skip them even if you notice them:
 
 ### Output
 
-Append to `$OUTPUT_DIR/audit.md`. Every finding must use this exact structure:
+Write to `$MIRRORED/review.md`. Every finding must use this exact structure:
 
 ```markdown
 ### N. [SEVERITY] One-line title naming the bug and location
 - **Location:** `path/to/file.ext:line` or `:line-range`
 - **Class:** <one tag from the checklist, e.g. "heap-overflow via unchecked length", "double-free on error path">
+- **Evidence:** `static_corroboration`
 - **Trigger:** concrete input/condition an attacker supplies (e.g. "POST /upload with Content-Length > 8192")
 - **Data flow:** 1-3 line trace from attacker input to dangerous operation, naming the specific functions and lines
 - **Impact:** what the attacker achieves (RCE, auth bypass, data disclosure, etc.)
@@ -321,6 +476,7 @@ Severity:
 > **[HIGH] Unchecked length in `parse_header()` → stack overflow in `src/proto.c:142`**
 > - **Location:** `src/proto.c:142`
 > - **Class:** stack-buffer-overflow via unbounded copy
+> - **Evidence:** `static_corroboration`
 > - **Trigger:** peer sends a `HELLO` frame where the `name` field exceeds 128 bytes
 > - **Data flow:** `read_frame()` (src/proto.c:88) reads up to 8192 bytes into `frame.body`; `parse_header()` (:142) `memcpy`s `frame.name` into a 128-byte stack buffer `name_buf` using `frame.name_len`, which is only validated to be non-zero (:140) — never against `sizeof(name_buf)`.
 > - **Impact:** Remote code execution via stack corruption. No authentication required.
@@ -339,46 +495,397 @@ This is a fake example, shown for structure only. Do not pattern-match your find
 
 ### Output
 
-Append findings to `$OUTPUT_DIR/audit.md`. This is the final consolidated report.
+Write findings to `$MIRRORED/review.md`. This is a working document — Phase 5 will synthesize it into the final report. Use the three-section structure below (Exploitable, Defects, Quality/Correctness), all present even if empty:
+
+```markdown
+# Code Review Findings
+
+**Target:** /absolute/path/to/codebase
+**Date:** YYYY-MM-DD
+**Mode:** important-only | all-bugs
+**Semgrep parse failures reviewed:** N files
+
+## Exploitable
+
+### 1. [CRITICAL] Unauthenticated admin endpoint
+- **Location:** `src/api/admin.go:55-72`
+- **Class:** missing authorization
+- **Evidence:** `static_corroboration`
+- **Trigger:** any HTTP client POSTs to `/admin/reset`
+- **Data flow:** no auth middleware registered on this route (main.go:44); handler unconditionally wipes the users table
+- **Impact:** full data loss
+- **Confidence:** HIGH
+- **Recommendation:** add auth middleware consistent with other admin routes
+
+## Defects
+
+### 1. `src/util.c:103` — unbounded `gets()`
+- **Bug:** `gets` with no length check reads into a 128-byte buffer.
+- **Evidence:** `pattern_match`
+- **Reachability in this scan:** only caller found is `tests/self_test.c` passing a constant.
+- **Reachability we did NOT verify:** shared utility module; may be consumed by other code.
+- **Fix:** replace with `fgets(buf, sizeof(buf), stdin)`.
+
+## Quality / Correctness
+
+### 1. `src/net.c:92` — missing errno check after recv()
+- `recv()` return value used without checking for -1. Defensively wrong but stays within bounds.
+```
+
+Phase 3 does NOT produce the final consolidated report — that's Phase 5's job. `review.md` stays frozen once written.
+
+---
+
+## Phase 4: Proof-of-Bug
+
+Attempt to build the project with sanitizers, generate PoC inputs, and validate findings via a patch oracle. **Only runs when the user explicitly requests it** (`prove`, `with proof`, `confirm bugs`, `full pipeline`).
+
+### Scope and budget
+
+Collect all findings from Phases 2-3 that are classified as **Exploitable** or **Defect** with evidence ≥ `static_corroboration`. These are candidates for proof.
+
+- If ≤10 candidates: attempt proof for all, starting with highest severity.
+- If >10 candidates: sort by (severity descending, confidence descending). Attempt the top 10. Report the rest as "not attempted — budget exceeded."
+
+### Step 4a: Build Discovery and Sanitizer Strategy
+
+The goal is to build the project's **real binary/library** with sanitizers — not to copy files out and compile them standalone. Large projects with internal dependencies, generated headers, or complex link graphs cannot be compiled piecemeal. Always use the project's own build system.
+
+**4a-i. Detect the build system.** Check for these files in the target directory, in order:
+
+| File(s) | Build system |
+|---|---|
+| `BUILD`, `BUILD.bazel`, `WORKSPACE`, `WORKSPACE.bazel`, `MODULE.bazel` | Bazel |
+| `CMakeLists.txt` | CMake |
+| `Makefile`, `GNUmakefile` | Make |
+| `configure`, `configure.ac` | Autotools |
+| `meson.build` | Meson |
+| `Cargo.toml` | Cargo |
+| `go.mod` | Go |
+| `package.json` | npm/yarn |
+| `pyproject.toml`, `setup.py` | Python |
+| `*.sln`, `*.csproj` | .NET |
+
+**4a-ii. Check for existing sanitizer/debug build modes.** Before injecting flags yourself, interrogate the build system — many projects already have a way to build with sanitizers:
+
+- **CMake:** Look for presets or options:
+  - `grep -r "SANITIZE\|ASAN\|sanitize" CMakeLists.txt cmake/` — projects often have `-DENABLE_ASAN=ON` or `-DCMAKE_BUILD_TYPE=ASan`
+  - Check `CMakePresets.json` or `cmake/` dir for sanitizer presets
+  - Check if there's a `Debug` build type that enables sanitizers
+- **Bazel:** Check for sanitizer configs:
+  - `grep -r "sanitize\|asan" .bazelrc BUILD`
+  - Look for `--config=asan` in `.bazelrc` (common convention)
+  - Bazel native: `bazel build --features=asan //target` or `--copt=-fsanitize=address --linkopt=-fsanitize=address`
+- **Make:** Check Makefile for debug/sanitizer targets:
+  - `grep -i "asan\|sanitize\|debug" Makefile` — look for `make asan`, `make debug`, `make sanitize`
+  - Check if `CFLAGS` / `LDFLAGS` are respected (overrideable from command line)
+- **Meson:** Check for sanitizer options:
+  - `meson configure` lists options; `b_sanitize` is the built-in sanitizer option
+  - `meson setup build -Db_sanitize=address,undefined`
+- **Cargo:** `RUSTFLAGS="-Zsanitizer=address"` (requires nightly)
+- **Go:** `-race` flag; no ASan equivalent. Use the project's test suite.
+- **Autotools:** Check `./configure --help | grep -i sanitize`
+
+If the project has a documented sanitizer mode, **use it**. It handles link dependencies, custom allocators, and suppression files correctly. Only fall back to flag injection if no built-in mode exists.
+
+**4a-iii. Build with sanitizers.** Based on what you found:
+
+| Scenario | Approach |
+|---|---|
+| Project has `-DENABLE_ASAN=ON` or `--config=asan` or `make asan` | Use the project's own mode |
+| Make with overrideable CFLAGS | `make CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1" LDFLAGS="-fsanitize=address,undefined"` |
+| CMake, no preset | `cmake -B build-asan -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" && cmake --build build-asan` |
+| Bazel, no config | `bazel build --copt=-fsanitize=address --copt=-fsanitize=undefined --linkopt=-fsanitize=address --linkopt=-fsanitize=undefined //target` |
+| Meson | `meson setup build-asan -Db_sanitize=address,undefined && meson compile -C build-asan` |
+| Single-file / trivial Makefile | Direct compiler invocation is acceptable (see below) |
+
+For **single-file projects or trivial builds** (no internal deps beyond what's in one compilation unit), direct compiler invocation is fine:
+```bash
+gcc -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer -g -O1 \
+    -o "$MIRRORED/proof/server_asan" "$TARGET/src/server.c" -lpthread
+```
+
+For **projects with internal dependencies**, always build through the build system. Never try to manually resolve include paths and link dependencies for a large project.
+
+**4a-iv. Identify the target binary/library.** After building, determine what executable or library to test against:
+- For servers/CLIs: the built binary
+- For libraries: you'll need a test harness (Step 4b)
+- Record the path to the built artifact
+
+**If compilation fails:** record the error in `proof/build.log`, report "build failed — evidence stays at `static_corroboration`", and skip to Phase 5. Don't spend more than 3 attempts fixing build issues.
+
+```bash
+mkdir -p "$MIRRORED/proof"
+
+{
+  echo "Build system: <detected>"
+  echo "Existing sanitizer mode: <what was found, or 'none'>"
+  echo "Build command: <exact command used>"
+  echo "Sanitizers: ASan + UBSan (or what's available)"
+  echo ""
+  echo "--- Build output ---"
+} > "$MIRRORED/proof/build.log"
+
+<build_command> >> "$MIRRORED/proof/build.log" 2>&1
+BUILD_OK=$?
+
+if [ $BUILD_OK -ne 0 ]; then
+  echo "BUILD FAILED — see proof/build.log" >> "$MIRRORED/proof/build.log"
+fi
+```
+
+### Step 4b: PoC Generation
+
+For each candidate finding (in priority order):
+
+1. **Read the finding** — location, bug class, trigger description, data flow.
+2. **Write a minimal PoC** that exercises the bug. The PoC type depends on what the project is:
+
+   | Project type | PoC approach |
+   |---|---|
+   | Server (HTTP, WebSocket, etc.) | Script (Python) that sends crafted requests to the running server |
+   | CLI tool | Script that invokes the binary with crafted arguments/stdin |
+   | Library with public API | Small C/Go/Python harness that links against the built library and calls the vulnerable function |
+   | Library with only internal APIs | Harness that `#include`s the source directly (acceptable for small files) or uses `dlsym`/`-Wl,--whole-archive` to access internal symbols |
+
+3. **Run the PoC** against the sanitizer-instrumented build.
+   - For servers: start the ASan-built server, run the PoC script, then stop the server and check its stderr for sanitizer output.
+   - For harnesses: compile the harness linking against the ASan-built library, then run it.
+   - For CLIs: run the ASan-built binary with crafted input.
+
+4. **Check the result:**
+   - ASan/UBSan report → `crash_reproduced`. Save sanitizer output to `proof/finding_N_asan.txt`.
+   - Crash (segfault, abort) → `crash_reproduced`. Save crash info.
+   - Observable misbehavior matching the predicted bug (e.g., path traversal reads a file it shouldn't) → `crash_reproduced`.
+   - Clean exit, no error → finding stays at `static_corroboration`. Note "PoC did not trigger."
+
+**Example — server-based PoC:**
+```python
+#!/usr/bin/env python3
+"""PoC for Finding 1: path traversal in file serving."""
+import socket, subprocess, time, tempfile, os
+
+SERVER_BIN = "/path/to/asan-built/server"
+# Start server, send crafted request, check response/stderr for evidence
+```
+
+**Example — library harness PoC:**
+```bash
+# Compile harness against the ASan-built library
+gcc -fsanitize=address,undefined -g -O1 \
+    -I"$TARGET/include" -o "$MIRRORED/proof/poc_1" \
+    "$MIRRORED/proof/poc_1.c" \
+    -L"$TARGET/build-asan/lib" -lmylib -Wl,-rpath,"$TARGET/build-asan/lib"
+```
+
+### Step 4c: Patch Oracle
+
+For each finding that reached `crash_reproduced`:
+
+1. **Write a minimal fix** — the smallest change that eliminates the bug. Save as `proof/patch_N.diff`.
+2. **Apply the patch** to the source tree (or a worktree — see below) and **rebuild using the same build system and sanitizer flags**.
+3. **Re-run the same PoC** against the patched build.
+4. **Evaluate:**
+   - PoC no longer triggers → `patch_validated`. The fix causally addresses the bug.
+   - PoC still triggers → the theory was wrong, or the fix was incomplete. Stay at `crash_reproduced` with a note. Don't iterate more than once.
+   - Build fails after patch → patch was wrong. Stay at `crash_reproduced`.
+
+**Patch application strategy** — choose based on project complexity:
+
+| Project size | Strategy |
+|---|---|
+| Small (≤5 source files, no build system deps) | Copy affected file(s) to `proof/`, patch there, compile standalone |
+| Medium (real build system but fast rebuild) | Apply patch in-place with `git apply`, rebuild, then `git checkout -- <file>` to restore |
+| Large / slow rebuild | Use a git worktree: `git worktree add ../proof-worktree HEAD`, apply patch there, build there |
+
+For **in-place patching** (medium projects):
+```bash
+# Apply patch
+cd "$TARGET"
+git apply "$MIRRORED/proof/patch_1.diff"
+
+# Rebuild (same command as 4a-iii)
+<same_build_command> 2>&1 | tee "$MIRRORED/proof/patch_1_build.log"
+
+# Run PoC against patched binary
+<run_poc> > "$MIRRORED/proof/poc_1_patched_output.txt" 2>&1
+
+# Restore original source
+git checkout -- .
+```
+
+For **worktree patching** (large projects):
+```bash
+cd "$TARGET"
+git worktree add "$MIRRORED/proof/worktree" HEAD
+cd "$MIRRORED/proof/worktree"
+git apply "$MIRRORED/proof/patch_1.diff"
+<build_command>
+<run_poc>
+cd "$TARGET"
+git worktree remove "$MIRRORED/proof/worktree"
+```
+
+For **small standalone projects** (the copy approach still works here):
+```bash
+cp "$TARGET/src/server.c" "$MIRRORED/proof/server_patched.c"
+# Apply fix directly to the copy
+gcc -fsanitize=address,undefined -g -O1 \
+    -o "$MIRRORED/proof/server_patched" "$MIRRORED/proof/server_patched.c" -lpthread
+```
+
+**File extensions matter.** When copying source files for patching, keep a `.c` / `.cpp` / `.cc` extension — gcc/clang infer the language from the extension.
+
+### Step 4d: Write Proof Summary
+
+After all proof attempts, write `$MIRRORED/proof/proof.md`. This is Phase 4's artifact — it does NOT edit `review.md` or any other phase's output. Phase 5 will read this to apply final evidence levels in the consolidated report.
+
+```markdown
+# Proof-of-Bug Results
+
+**Build system:** CMake with gcc 13.2
+**Sanitizers:** ASan + UBSan
+**Findings attempted:** 3 of 5
+
+| # | Finding | Evidence Before | Evidence After | Artifacts |
+|---|---------|----------------|----------------|-----------|
+| 1 | Stack overflow in log_request() | static_corroboration | patch_validated | poc_1.c, patch_1.diff |
+| 2 | Integer truncation in parse_len() | static_corroboration | crash_reproduced | poc_2.c |
+| 3 | NULL deref in config parser | static_corroboration | static_corroboration | poc_3.c (did not trigger) |
+| 4 | Use of gets() in util.c | pattern_match | not attempted | — |
+| 5 | Missing bounds check in net.c | suspicion | not attempted | — |
+
+## Finding 1: Stack overflow in log_request()
+
+**PoC:** `poc_1.c` — calls log_request() with 256-byte payload.
+**Result:** ASan reports stack-buffer-overflow at log.c:44 (see `poc_1_output.txt`).
+**Patch:** `patch_1.diff` — replaces strcpy with snprintf.
+**Patch oracle:** PoC runs cleanly after patch (see `poc_1_patched_output.txt`). Evidence promoted to `patch_validated`.
+
+## Finding 2: ...
+```
+
+---
+
+## Phase 5: Final Report
+
+Synthesize all findings from Phases 2-4 into a single authoritative report, apply final evidence levels, and document variant patterns for confirmed bugs. **Only runs when the user explicitly requests it** (`variants`, `variant analysis`, `full pipeline`).
+
+Phase 5 reads `triage.md`, `review.md`, and `proof/proof.md` (if they exist) and produces one consolidated `report.md`. This is the deliverable — the reader shouldn't need to look at earlier artifacts unless they want working details.
+
+### Steps
+
+1. **Read all prior phase artifacts** — `triage.md`, `review.md`, `proof/proof.md`.
+2. **Merge and deduplicate findings.** A finding that appears in both triage and review is listed once, with the richer description.
+3. **Apply final evidence levels.** If Phase 4 promoted a finding (e.g., `static_corroboration` → `patch_validated`), use the promoted level in the report.
+4. **For each finding at `crash_reproduced` or `patch_validated`, write variant documentation** (see below).
+5. **Write `$MIRRORED/report.md`** using the template below.
+
+### Variant Documentation
+
+For every confirmed finding, document the bug pattern:
+
+1. **Extract the abstract pattern.** What structural property made this bug possible? Not variable names — the shape.
+2. **Search the codebase for structural matches.** Grep for same API calls, same data flow patterns, same cast patterns.
+3. **Write a semgrep rule sketch** if feasible — include structural constraints so it's not too broad.
+4. **List other instances** found and assess whether they're also exploitable.
+
+### Output
+
+Write `$MIRRORED/report.md`:
 
 ```markdown
 # Security Audit Report
 
-**Target:** /path/to/codebase
+**Target:** /absolute/path/to/codebase
 **Date:** YYYY-MM-DD
-**Phases run:** 1, 2, 3
+**Phases run:** 1, 2, 3, 4, 5
+**Mode:** important-only | all-bugs
+**Semgrep parse failures:** N files
 
 ## Summary
 
 <2-3 sentence overview: what was scanned, what was found, overall assessment>
 
-## Critical / High Findings
+## Exploitable
 
-### 1. [CRITICAL] Unauthenticated admin endpoint
-- **Location:** `src/api/admin.go:55-72`
-- **Issue:** The `/admin/reset` endpoint has no auth middleware. Any HTTP client can trigger a database reset.
-- **Impact:** Full data loss.
-- **Recommendation:** Add auth middleware consistent with other admin routes.
+### 1. [CRITICAL] Title
+- **Location:** `path:line`
+- **Class:** bug class
+- **Evidence:** `patch_validated`
+- **Trigger:** concrete attacker input
+- **Data flow:** source → sink trace
+- **Impact:** what attacker achieves
+- **Confidence:** HIGH
+- **Recommendation:** concrete fix
 
-### 2. [HIGH] ...
+## Defects
 
-## Medium Findings
-...
+### 1. `path:line` — title
+- **Bug:** description
+- **Evidence:** `static_corroboration`
+- **Reachability in this scan:** what was verified
+- **Reachability we did NOT verify:** what wasn't
+- **Fix:** concrete fix
 
-## Low / Informational
-...
+## Quality / Correctness
+
+### 1. `path:line` — title
+- Description of fragile pattern or defense-in-depth gap.
+
+## Proof-of-Bug Summary
+
+| # | Finding | Evidence Before | Evidence After | Artifacts |
+|---|---------|----------------|----------------|-----------|
+| 1 | ... | static_corroboration | patch_validated | poc_1.c, patch_1.diff |
+
+## Variant Patterns
+
+### Variant 1: <pattern name>
+
+**Source finding:** Finding N — <title>
+**Abstract pattern:** <1-2 sentence structural description>
+
+**Detection heuristic:**
+- Grep: `<regex>`
+- Semgrep rule sketch:
+  ```yaml
+  rules:
+    - id: <pattern-name>
+      pattern: ...
+      severity: WARNING
+      languages: [c, cpp]
+  ```
+
+**Other instances in this codebase:**
+- `path:line` — description — exploitable / safe (reason)
+
+**Assessment:** N instances found, M potentially exploitable.
+
+## Coverage Notes
+
+- **Files semgrep couldn't parse:** N (see `semgrep/parse-failures.txt`)
+- **Test code:** excluded
+- **Vendored / third-party code:** excluded
+- **What was NOT reviewed:** <out-of-scope items>
 
 ## Semgrep Triage Summary
 
-- **Total findings:** N
-- **True positives:** N (X critical, Y high, Z medium)
-- **False positives:** N
-- **Details:** See `triage.md`
-
-## Scope & Limitations
-
-<What was reviewed, what wasn't, and any caveats>
+- **Total raw findings:** N
+- **After important-only filter:** N
+- **Triaged as exploitable:** N
+- **Triaged as defects:** N
+- **Triaged as quality / correctness:** N
+- **Triaged as false positives:** N
 ```
+
+### If Phase 4 did not run
+
+If only Phases 1-3 + 5 ran (user said `variants` but not `prove`), the report omits "Proof-of-Bug Summary" and "Variant Patterns" sections. Evidence levels stay as-is from Phase 3. The report is still the authoritative consolidated output.
+
+### If Phase 5 runs standalone
+
+Phase 5 can run after a previous session produced phases 1-4. It reads whatever artifacts exist under `$MIRRORED/` and synthesizes. Missing phases are noted in Coverage Notes.
 
 ---
 
@@ -396,9 +903,12 @@ find "$OUTPUT_DIR" -name '*.stderr' -empty -delete
 If the skill created any other temporary files during a run (intermediate jq pipes, temp copies, scratch notes under `/tmp`, etc.), delete them in this step.
 
 **Keep:**
-- `audit.md`, `triage.md` — final reports
+- `report.md` — final consolidated report (Phase 5)
+- `review.md` — manual code review findings (Phase 3)
+- `triage.md` — semgrep triage (Phase 2)
 - `semgrep/*.json` — raw findings, source of truth for re-triage
 - `semgrep/*-important.json` — filter output (if important-only mode was used)
+- `proof/` — proof.md + PoC source, sanitizer output, patches, build log (Phase 4)
 - Any `.stderr` file that has content (something actually failed — the user needs to see it)
 
 **Delete:**
@@ -419,3 +929,8 @@ Never delete files the user already had or anything outside `$OUTPUT_DIR` / the 
 - Classifying a semgrep finding as "false positive" without reading the actual source code in context
 - Reviewing only files semgrep flagged — Phase 3 should find things semgrep missed
 - Listing every file read instead of focusing on what's wrong
+- Copying source files out of tree and compiling standalone for projects with real build systems — use the project's build system
+- Modifying original source files without restoring them — use `git apply` + `git checkout`, worktrees, or copies for small projects
+- Spending more than 3 attempts fixing build failures — report and move on
+- Running Phase 4 on `suspicion`-level findings — waste of cycles; only `static_corroboration` and above
+- Writing variant semgrep rules that are too broad (will fire on every `strcpy` call) — include structural constraints
