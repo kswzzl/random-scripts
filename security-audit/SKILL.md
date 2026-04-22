@@ -10,8 +10,10 @@ description: >-
   individually or together. Use when asked to audit code, find vulnerabilities,
   review security, do static analysis, or scan for bugs.
 allowed-tools:
+  - Agent
   - Bash
   - Read
+  - Write
   - Glob
   - Grep
 ---
@@ -50,9 +52,11 @@ Detect these from the user's prompt — no formal parser.
 | `prove`, `proof`, `with proof`, `confirm bugs` | Run Phase 4 (proof-of-bug) after code review |
 | `variants`, `variant analysis` | Run Phase 5 (final report + variant documentation) |
 | `full pipeline`, `everything` | Run all five phases |
+| `passes:N`, `N passes` | Set Phase 3 review pass count (default: 3) |
+| `1 pass`, `single pass` | Run Phase 3 with only 1 review pass |
 | `output to <dir>`, `into <dir>` | Custom output directory |
 
-**Default (no flags):** Phases 1-3 only, **important-only mode** (severity + metadata filter on Phase 1, ≥80% confidence on Phase 3, high-value true positives only on Phase 2). Output dir = `./security_audit_N` (auto-incremented). Phases 4-5 require explicit opt-in (`prove`, `variants`, or `full pipeline`).
+**Default (no flags):** Phases 1-3 only, **important-only mode** (severity + metadata filter on Phase 1, ≥80% confidence on Phase 3, high-value true positives only on Phase 2). Phase 3 runs **3 parallel review passes** by default. Output dir = `./security_audit_N` (auto-incremented). Phases 4-5 require explicit opt-in (`prove`, `variants`, or `full pipeline`).
 
 **Important-only is the default across all phases** because noise defeats the point of the skill. Users who want the full unfiltered output must explicitly opt in with `all bugs` or equivalent.
 
@@ -75,8 +79,8 @@ $OUTPUT_DIR/<MIRRORED_SUBPATH>/
 │   ├── <lang>-<rule>.json
 │   ├── <lang>-<rule>-important.json
 │   └── parse-failures.txt # files semgrep couldn't parse (Phase 1f)
-├── triage.md             # Phase 2: finding-by-finding triage
-├── review.md             # Phase 3: manual code review findings
+├── triage.md             # Phase 2: finding-by-finding triage (merged if parallelized)
+├── review.md             # Phase 3: merged code review findings (from N passes)
 ├── proof/                # Phase 4: proof-of-bug artifacts (if run)
 │   ├── proof.md          # summary table + per-finding notes
 │   ├── build.log         # build system detection + compile output
@@ -85,6 +89,11 @@ $OUTPUT_DIR/<MIRRORED_SUBPATH>/
 │   ├── patch_N.diff      # minimal fix for finding N
 │   └── poc_N_patched_output.txt  # re-run after patch
 └── report.md             # Phase 5: final consolidated report + variant patterns
+
+# Transient (deleted during cleanup):
+# orient.md              — Phase 3 system map, used to brief subagents
+# review_pass_K.md       — Phase 3 per-pass results before merge
+# triage_chunk_N.md      — Phase 2 per-chunk results before merge
 ```
 
 **One artifact per phase.** Each phase writes its own file and never edits another phase's output. Phase 5 (`report.md`) is the authoritative final report — it synthesizes findings from phases 2-4, applies final evidence levels, and appends variant documentation. Earlier artifacts (`triage.md`, `review.md`, `proof/proof.md`) are working documents that remain frozen at the state they were written.
@@ -282,6 +291,17 @@ This file is a first-class input to Phase 3 — not just a diagnostic. Every lis
 
 Read each semgrep finding, look at the actual source code in context, and classify it.
 
+### Parallelization
+
+If there are **>15 findings** to triage, split them into chunks of ~8-10 and triage each chunk as a parallel subagent. Each subagent gets:
+- The chunk of findings (rule ID, file, line range)
+- The target directory path
+- The four-bucket classification instructions below
+
+Each subagent writes its results to a temp file (`$MIRRORED/triage_chunk_N.md`). After all complete, merge into `$MIRRORED/triage.md` and delete the chunk files.
+
+For ≤15 findings, triage inline (no subagents needed).
+
 ### For each finding:
 
 1. **Skip test findings.** If the finding's file path matches any test pattern (path contains `test`, `tests`, `spec`, `mocks`, `fixtures`, `testdata`, `benchmark`, `examples`; or basename matches `test_*`, `*_test.*`, `*.test.*`, `*.spec.*`), skip it silently. We don't report bugs in test code.
@@ -345,27 +365,57 @@ If the user **did** ask for `all bugs`, triage the full raw JSON. Prioritize ERR
 
 ## Phase 3: Code Review
 
-Read the codebase and look for bugs, vulnerabilities, and design issues that pattern-matching can't catch.
+Read the codebase and look for bugs, vulnerabilities, and design issues that pattern-matching can't catch. Phase 3 runs **multiple independent review passes** in parallel to maximize recall, then merges and deduplicates findings.
 
 This prompt synthesizes practices from Anthropic's production /security-review, Google Project Zero's Naptime/Big Sleep agent, and the Semgrep/Crash Override writeups on LLM-driven code review. It's opinionated — follow the structure even if it feels heavy.
 
-### Role
+### Multi-pass architecture
 
-You are a senior security engineer auditing this codebase for exploitable vulnerabilities. Your goal is **high-confidence findings with real exploitation potential**, not an exhaustive list of every theoretical concern. Better to miss some theoretical issues than flood the report with false positives.
+Phase 3 runs N independent review passes in parallel (default: 3, configurable via `passes:N` or `1 pass`). Each pass is a subagent that independently reviews the codebase. This exploits LLM non-determinism — each pass naturally explores different code paths and catches different bugs.
 
-### Three-phase methodology
+**Step 3.0: Orient (runs once, in the parent).** Before spawning review passes, the parent builds a system map that all passes will receive:
 
-**A. Orient.** Before reading any code in depth, build a map of the system:
-- What does it do? (read the README or top-level file if present)
+- What does the project do? (read the README or top-level file if present)
 - What are the entry points for untrusted input? (HTTP handlers, CLI args, file readers, socket listeners, deserialization, IPC, env vars)
 - What are the privileged sinks? (exec, SQL, file writes, auth decisions, crypto operations, memory allocation with external sizes)
 - What's the trust boundary? Where does the code decide "this input is now safe"?
+- List all source files and their approximate purpose (1 line each)
+- If Phase 1 ran: read `$MIRRORED/semgrep/parse-failures.txt` — these files have zero semgrep coverage and must be reviewed
+- If Phase 2 ran: read `$MIRRORED/triage.md` for context on what semgrep already found
 
-**Priority input (if Phase 1 ran):** read `$MIRRORED/semgrep/parse-failures.txt`. Every file listed there was skipped by the scanner — semgrep has **zero coverage** on those files. They MUST be reviewed in this phase regardless of how you prioritize elsewhere. Parse-failing files tend to be macro-heavy or use modern C++ — exactly the kind of code where subtle bugs hide. Treat them as first-class audit targets.
+Write the orient summary to `$MIRRORED/orient.md`. This is an intermediate artifact used to brief subagents — it is not a deliverable.
+
+**Step 3.1: Spawn review passes.** Launch N subagents in parallel using the Agent tool. Each subagent receives:
+
+1. The orient summary (full text of `orient.md`)
+2. The target directory path
+3. The full review methodology (Role, Bug-class checklist, Hard exclusions, Confidence threshold, Output format) — copied verbatim from this skill into the subagent prompt
+4. The instruction: "You are review pass K of N. Conduct an independent security review. Write your findings to `$MIRRORED/review_pass_K.md`."
+
+Each subagent writes its own `review_pass_K.md` using the same finding format as the Output section below.
+
+**Do NOT tell later passes what earlier passes found.** The passes must be independent — anchoring on prior findings defeats the purpose. The whole point is that each pass explores the codebase with fresh eyes, and non-determinism naturally leads to different coverage.
+
+**Step 3.2: Merge and deduplicate (runs in the parent after all passes complete).**
+
+1. Read all `review_pass_K.md` files.
+2. Deduplicate: two findings are the same if they reference the same location (file + line range) and the same bug class. Keep the version with the richer description / more complete data flow trace.
+3. If different passes found the same bug but described it differently, merge the best parts of each description.
+4. If a finding appears in multiple passes, note this — it's a signal of higher confidence.
+5. Write the merged, deduplicated result to `$MIRRORED/review.md`.
+6. Delete the intermediate `review_pass_K.md` files and `orient.md`.
+
+The merge header in `review.md` should note: `**Review passes:** N (findings appearing in multiple passes noted)`.
+
+### Role (passed to each subagent)
+
+You are a senior security engineer auditing this codebase for exploitable vulnerabilities. Your goal is **high-confidence findings with real exploitation potential**, not an exhaustive list of every theoretical concern. Better to miss some theoretical issues than flood the report with false positives.
+
+### Review methodology (passed to each subagent)
 
 **Always ignore test code.** Skip any file whose path contains `test`, `tests`, `spec`, `mocks`, `fixtures`, `testdata`, `benchmark`, `examples`; or whose basename matches `test_*`, `*_test.*`, `*.test.*`, `*.spec.*`. Findings in test code are not reported. The only exception is `include tests` invocation.
 
-**B. Form hypotheses, then verify.** This is a ReAct loop: *hypothesize → read related code → confirm or discard*. Don't report a hypothesis as a finding until you've actually traced the data flow.
+**Form hypotheses, then verify.** This is a ReAct loop: *hypothesize → read related code → confirm or discard*. Don't report a hypothesis as a finding until you've actually traced the data flow.
 
 For each suspicious pattern you notice:
 1. State the hypothesis precisely (what's the bug class, what's the mechanism, what's the impact?)
@@ -374,7 +424,7 @@ For each suspicious pattern you notice:
 
 Do **not** just list concerns. Every reported finding must have traced data flow from attacker-controlled input to the dangerous operation.
 
-**C. Report.** Only findings where you'd bet on real exploitability.
+**Report.** Only findings where you'd bet on real exploitability.
 
 ### Bug-class checklist
 
@@ -449,9 +499,9 @@ These are noise at this layer. Skip them even if you notice them:
 
 **If the user invoked the skill with `all bugs` / `no filter` / `include low`:** drop the confidence gate. Report everything you'd bet is a real issue at any confidence level, including speculative concerns and defense-in-depth items, with honest confidence labels on each. Do not use this mode as an excuse to invent findings — unchecked speculation is still out.
 
-### Output
+### Finding format (passed to each subagent)
 
-Write to `$MIRRORED/review.md`. Every finding must use this exact structure:
+Every finding must use this exact structure:
 
 ```markdown
 ### N. [SEVERITY] One-line title naming the bug and location
@@ -485,7 +535,7 @@ Severity:
 
 This is a fake example, shown for structure only. Do not pattern-match your findings against it.
 
-### Don't
+### Don't (passed to each subagent)
 
 - Don't enumerate every file systematically — follow the code, not the directory tree
 - Don't invent findings to pad the report; a focused report with 2-3 real bugs beats a noisy report with 15 maybes
@@ -493,9 +543,13 @@ This is a fake example, shown for structure only. Do not pattern-match your find
 - Don't write findings that boil down to "this function lacks input validation" — name the attacker input, the sink, and the gap
 - Don't stop after one finding if there are more; but also don't manufacture more if there aren't
 
-### Output
+### Per-pass output format
 
-Write findings to `$MIRRORED/review.md`. This is a working document — Phase 5 will synthesize it into the final report. Use the three-section structure below (Exploitable, Defects, Quality/Correctness), all present even if empty:
+Each subagent writes its `review_pass_K.md` using the three-section structure (Exploitable, Defects, Quality/Correctness), all present even if empty.
+
+### Final output
+
+After merge and deduplication (Step 3.2), the parent writes `$MIRRORED/review.md`:
 
 ```markdown
 # Code Review Findings
@@ -503,6 +557,7 @@ Write findings to `$MIRRORED/review.md`. This is a working document — Phase 5 
 **Target:** /absolute/path/to/codebase
 **Date:** YYYY-MM-DD
 **Mode:** important-only | all-bugs
+**Review passes:** 3 (findings appearing in multiple passes noted)
 **Semgrep parse failures reviewed:** N files
 
 ## Exploitable
@@ -514,7 +569,7 @@ Write findings to `$MIRRORED/review.md`. This is a working document — Phase 5 
 - **Trigger:** any HTTP client POSTs to `/admin/reset`
 - **Data flow:** no auth middleware registered on this route (main.go:44); handler unconditionally wipes the users table
 - **Impact:** full data loss
-- **Confidence:** HIGH
+- **Confidence:** HIGH — found in 3/3 passes
 - **Recommendation:** add auth middleware consistent with other admin routes
 
 ## Defects
@@ -546,6 +601,12 @@ Collect all findings from Phases 2-3 that are classified as **Exploitable** or *
 
 - If ≤10 candidates: attempt proof for all, starting with highest severity.
 - If >10 candidates: sort by (severity descending, confidence descending). Attempt the top 10. Report the rest as "not attempted — budget exceeded."
+
+### Parallelization
+
+Step 4a (build) is serial — all findings share one sanitizer-instrumented build. Steps 4b-4c (PoC + patch oracle) are independent per-finding and can run as parallel subagents after the build completes. Each subagent gets the build artifact path, one finding's details, and writes its results to `proof/finding_N_result.md`. The parent merges into `proof/proof.md` and deletes intermediates.
+
+For ≤3 findings, run inline (no subagents). For >3 findings, parallelize.
 
 ### Step 4a: Build Discovery and Sanitizer Strategy
 
@@ -913,6 +974,9 @@ If the skill created any other temporary files during a run (intermediate jq pip
 
 **Delete:**
 - Empty `.stderr` files
+- `orient.md` — Phase 3 intermediate (should already be deleted in Step 3.2)
+- `review_pass_*.md` — Phase 3 per-pass intermediates (should already be deleted in Step 3.2)
+- `triage_chunk_*.md` — Phase 2 per-chunk intermediates (should already be deleted after merge)
 - Any scratch files the skill itself created during the run
 - Any temp dirs under `/tmp` that the skill invented for its own bookkeeping
 
