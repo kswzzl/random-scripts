@@ -17,36 +17,25 @@ External APIs:
     https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/repodata
     https://kojihub.stream.centos.org/kojihub  (XML-RPC)
     https://access.redhat.com/hydra/rest/securitydata/cve/<id>.json
-
-Cache:
-    ~/.cache/c9s-kernel/  (1h TTL; --ttl to override, --no-cache to bypass)
-    SRPM changelogs are cached for 7d since they're immutable per NVR.
 """
 
 from __future__ import annotations
 
 import argparse
 import gzip
-import hashlib
 import io
 import json
-import os
 import re
 import sys
-import time
 import urllib.request
 import xml.etree.ElementTree as ET
 import xmlrpc.client
 from dataclasses import dataclass
-from pathlib import Path
 
 REPO_BASE = "https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os"
 KOJI_URL = "https://kojihub.stream.centos.org/kojihub"
 REDHAT_CVE_URL = "https://access.redhat.com/hydra/rest/securitydata/cve/{cve}.json"
 
-CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "c9s-kernel"
-DEFAULT_TTL = 3600
-CHANGELOG_TTL = 7 * 24 * 3600
 USER_AGENT = "c9s-kernel/0.1"
 
 REPO_NS = {
@@ -62,16 +51,12 @@ SOURCES = ("released", "pending", "gate")
 # RPM version comparison (rpmvercmp algorithm)
 # --------------------------------------------------------------------------- #
 
-_ALNUM_RE = re.compile(r"([A-Za-z]+|[0-9]+)")
-
-
 def rpmvercmp(a: str, b: str) -> int:
     """Compare two RPM version/release strings. Returns -1 / 0 / 1."""
     if a == b:
         return 0
     i = j = 0
     while i < len(a) and j < len(b):
-        # ~ sorts before anything (including end-of-string)
         if a[i] == "~" or b[j] == "~":
             if a[i] != "~":
                 return 1
@@ -80,7 +65,6 @@ def rpmvercmp(a: str, b: str) -> int:
             i += 1
             j += 1
             continue
-        # ^ sorts after end-of-string but before anything else
         if a[i] == "^" or b[j] == "^":
             if i == len(a):
                 return -1
@@ -93,14 +77,12 @@ def rpmvercmp(a: str, b: str) -> int:
             i += 1
             j += 1
             continue
-        # Skip separators
         if not a[i].isalnum():
             i += 1
             continue
         if not b[j].isalnum():
             j += 1
             continue
-        # Extract a segment from each side
         if a[i].isdigit():
             ma = re.match(r"\d+", a[i:])
             seg_a = ma.group(0)
@@ -121,7 +103,6 @@ def rpmvercmp(a: str, b: str) -> int:
             seg_b = mb.group(0)
             j += len(seg_b)
             isnum_b = False
-        # Numeric beats alpha
         if isnum_a and not isnum_b:
             return 1
         if not isnum_a and isnum_b:
@@ -133,10 +114,8 @@ def rpmvercmp(a: str, b: str) -> int:
                 return 1 if len(seg_a) > len(seg_b) else -1
         if seg_a != seg_b:
             return 1 if seg_a > seg_b else -1
-    # One side exhausted
     if i == len(a) and j == len(b):
         return 0
-    # Trailing ~ on whichever side still has content makes it older
     rem = a[i:] if i < len(a) else b[j:]
     if rem.startswith("~"):
         return -1 if i < len(a) else 1
@@ -144,7 +123,6 @@ def rpmvercmp(a: str, b: str) -> int:
 
 
 def evr_compare(a: tuple[str, str, str], b: tuple[str, str, str]) -> int:
-    """Compare (epoch, version, release) tuples. Missing epoch defaults to 0."""
     ea, va, ra = a
     eb, vb, rb = b
     c = rpmvercmp(ea or "0", eb or "0")
@@ -158,11 +136,9 @@ def evr_compare(a: tuple[str, str, str], b: tuple[str, str, str]) -> int:
 
 def parse_evr(s: str) -> tuple[str, str, str] | None:
     """Parse 'kernel-0:5.14.0-427.13.1.el9_4' or 'kernel-5.14.0-697.el9' into (E, V, R)."""
-    # Strip leading 'name-' (everything up to and including the first '-')
     if "-" not in s:
         return None
     _name, rest = s.split("-", 1)
-    # rest is now [epoch:]version-release
     epoch = "0"
     if ":" in rest.split("-", 1)[0]:
         epoch, rest = rest.split(":", 1)
@@ -173,45 +149,13 @@ def parse_evr(s: str) -> tuple[str, str, str] | None:
 
 
 # --------------------------------------------------------------------------- #
-# Cache
-# --------------------------------------------------------------------------- #
-
-def _cache_path(key: str) -> Path:
-    h = hashlib.sha256(key.encode()).hexdigest()[:24]
-    return CACHE_DIR / f"{h}.bin"
-
-
-def cache_get(key: str, ttl: int) -> bytes | None:
-    p = _cache_path(key)
-    if not p.exists():
-        return None
-    if ttl > 0 and time.time() - p.stat().st_mtime > ttl:
-        return None
-    return p.read_bytes()
-
-
-def cache_put(key: str, data: bytes) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    p = _cache_path(key)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_bytes(data)
-    tmp.replace(p)
-
-
-# --------------------------------------------------------------------------- #
 # HTTP
 # --------------------------------------------------------------------------- #
 
-def http_get(url: str, ttl: int = DEFAULT_TTL, no_cache: bool = False) -> bytes:
-    if not no_cache:
-        cached = cache_get(url, ttl)
-        if cached is not None:
-            return cached
+def http_get(url: str) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=60) as resp:
-        data = resp.read()
-    cache_put(url, data)
-    return data
+        return resp.read()
 
 
 # --------------------------------------------------------------------------- #
@@ -247,10 +191,10 @@ def _primary_href(repomd: ET.Element) -> str:
     raise RuntimeError("primary data block not found in repomd.xml")
 
 
-def latest_released_kernel(no_cache: bool, ttl: int) -> Nevra:
-    repomd_raw = http_get(f"{REPO_BASE}/repodata/repomd.xml", ttl=ttl, no_cache=no_cache)
+def latest_released_kernel() -> Nevra:
+    repomd_raw = http_get(f"{REPO_BASE}/repodata/repomd.xml")
     href = _primary_href(ET.fromstring(repomd_raw))
-    primary_gz = http_get(f"{REPO_BASE}/{href}", ttl=ttl, no_cache=no_cache)
+    primary_gz = http_get(f"{REPO_BASE}/{href}")
     xml_bytes = gzip.decompress(primary_gz)
 
     pkg_tag = f"{{{REPO_NS['c']}}}package"
@@ -310,14 +254,8 @@ def latest_tagged_kernel(tag: str) -> Nevra | None:
     )
 
 
-def kernel_changelog(nvr: str, no_cache: bool) -> list[tuple[str, str, int]]:
+def kernel_changelog(nvr: str) -> list[tuple[str, str, int]]:
     """Return [(header, body, epoch_seconds), ...] newest first, from Koji SRPM headers."""
-    cache_key = f"changelog::{nvr}"
-    if not no_cache:
-        cached = cache_get(cache_key, CHANGELOG_TTL)
-        if cached is not None:
-            return [tuple(e) for e in json.loads(cached)]  # type: ignore[misc]
-
     s = _koji()
     build = s.getBuild(nvr)
     if not build:
@@ -329,9 +267,7 @@ def kernel_changelog(nvr: str, no_cache: bool) -> list[tuple[str, str, int]]:
     names = hdrs.get("CHANGELOGNAME") or []
     texts = hdrs.get("CHANGELOGTEXT") or []
     times = hdrs.get("CHANGELOGTIME") or []
-    entries = list(zip(names, texts, times))
-    cache_put(cache_key, json.dumps(entries).encode())
-    return entries
+    return list(zip(names, texts, times))
 
 
 def cves_in_changelog(entries: list[tuple[str, str, int]]) -> set[str]:
@@ -355,9 +291,8 @@ def cve_evidence(entries: list[tuple[str, str, int]], cve: str) -> str | None:
 # Red Hat Security Data
 # --------------------------------------------------------------------------- #
 
-def redhat_cve(cve: str, no_cache: bool, ttl: int) -> dict:
-    raw = http_get(REDHAT_CVE_URL.format(cve=cve), ttl=ttl, no_cache=no_cache)
-    return json.loads(raw)
+def redhat_cve(cve: str) -> dict:
+    return json.loads(http_get(REDHAT_CVE_URL.format(cve=cve)))
 
 
 def rhel9_kernel_fix(cve_data: dict) -> dict | None:
@@ -370,12 +305,38 @@ def rhel9_kernel_fix(cve_data: dict) -> dict | None:
 
 
 # --------------------------------------------------------------------------- #
+# Verdict
+# --------------------------------------------------------------------------- #
+
+def decide_verdict(version_patched: bool | None,
+                   changelog_evidence: str | None) -> tuple[str, str]:
+    """Return (verdict, reason) for a single (source, CVE) pair.
+
+    `version_patched` is True/False if Red Hat has published a RHEL 9 fixed
+    NEVRA we could compare against, None otherwise.
+    `changelog_evidence` is the changelog line that mentions the CVE, or None.
+
+    Verdict is "patched" iff version comparison says we're at or past the
+    fix, or the changelog mentions the CVE. Otherwise "not_patched" — which
+    includes the "no Red Hat record and no changelog mention" case, since
+    the actionable interpretation is "no kernel covers this yet".
+    """
+    if version_patched is True:
+        return "patched", "kernel >= RHEL9 fix"
+    if changelog_evidence:
+        return "patched", "backport in changelog"
+    if version_patched is False:
+        return "not_patched", "kernel older than RHEL9 fix"
+    return "not_patched", "no fix in changelog or Red Hat data"
+
+
+# --------------------------------------------------------------------------- #
 # Source dispatch
 # --------------------------------------------------------------------------- #
 
-def resolve_source(source: str, no_cache: bool, ttl: int) -> Nevra | None:
+def resolve_source(source: str) -> Nevra | None:
     if source == "released":
-        return latest_released_kernel(no_cache, ttl)
+        return latest_released_kernel()
     if source == "pending":
         return latest_tagged_kernel("c9s-pending")
     if source == "gate":
@@ -391,7 +352,7 @@ def cmd_latest(args) -> int:
     out: dict[str, str | None] = {}
     for src in SOURCES:
         try:
-            n = resolve_source(src, args.no_cache, args.ttl)
+            n = resolve_source(src)
             out[src] = str(n) if n else None
         except Exception as e:
             out[src] = f"<error: {e}>"
@@ -413,10 +374,9 @@ def cmd_check(args) -> int:
             continue
         result: dict = {"cve": cve, "sources": {}, "redhat": None}
 
-        # Pull Red Hat first so we know the fixed NEVRA before per-source loop
         rh_fix_evr: tuple[str, str, str] | None = None
         try:
-            data = redhat_cve(cve, no_cache=args.no_cache, ttl=args.ttl)
+            data = redhat_cve(cve)
             fix = rhel9_kernel_fix(data)
             rh_fix_evr = parse_evr(fix["package"]) if fix and fix.get("package") else None
             result["redhat"] = {
@@ -430,7 +390,7 @@ def cmd_check(args) -> int:
 
         for src in SOURCES:
             try:
-                nevra = resolve_source(src, args.no_cache, args.ttl)
+                nevra = resolve_source(src)
             except Exception as e:
                 result["sources"][src] = {"error": f"resolve: {e}"}
                 continue
@@ -439,41 +399,24 @@ def cmd_check(args) -> int:
                 continue
 
             entry: dict = {"nvr": nevra.nvr}
-            # Version verdict via Red Hat fixed NEVRA
             if rh_fix_evr is not None:
                 our_evr = (nevra.epoch, nevra.version, nevra.release)
                 cmp = evr_compare(our_evr, rh_fix_evr)
                 entry["version_patched"] = cmp >= 0
                 entry["version_cmp"] = cmp
             else:
-                entry["version_patched"] = None  # Red Hat didn't list a RHEL 9 fix
+                entry["version_patched"] = None
 
-            # Changelog evidence
             try:
-                entries = kernel_changelog(nevra.nvr, no_cache=args.no_cache)
+                entries = kernel_changelog(nevra.nvr)
                 entry["changelog_evidence"] = cve_evidence(entries, cve)
             except Exception as e:
                 entry["changelog_error"] = str(e)
                 entry["changelog_evidence"] = None
 
-            # Verdict: PATCHED iff version comparison says so OR the changelog
-            # backports the CVE. Otherwise NOT PATCHED — including the case
-            # where Red Hat hasn't published a RHEL 9 fix and the changelog
-            # doesn't mention the CVE, which is the actionable "no kernel
-            # covers this yet" state.
-            if entry["version_patched"] is True or entry["changelog_evidence"]:
-                entry["verdict"] = "patched"
-                if entry["version_patched"] is True:
-                    entry["reason"] = "kernel >= RHEL9 fix"
-                else:
-                    entry["reason"] = "backport in changelog"
-            else:
-                entry["verdict"] = "not_patched"
-                if entry["version_patched"] is False:
-                    entry["reason"] = "kernel older than RHEL9 fix"
-                else:
-                    entry["reason"] = "no fix in changelog or Red Hat data"
-
+            entry["verdict"], entry["reason"] = decide_verdict(
+                entry["version_patched"], entry["changelog_evidence"]
+            )
             result["sources"][src] = entry
 
         findings.append(result)
@@ -522,11 +465,11 @@ def cmd_check(args) -> int:
 
 
 def cmd_changelog(args) -> int:
-    nevra = resolve_source(args.source, args.no_cache, args.ttl)
+    nevra = resolve_source(args.source)
     if nevra is None:
         print(f"no kernel found for source {args.source}", file=sys.stderr)
         return 2
-    entries = kernel_changelog(nevra.nvr, no_cache=args.no_cache)
+    entries = kernel_changelog(nevra.nvr)
     print(f"# {nevra} — {len(entries)} changelog entries")
     print()
     shown = entries[: args.limit] if args.limit else entries
@@ -538,11 +481,11 @@ def cmd_changelog(args) -> int:
 
 
 def cmd_cves(args) -> int:
-    nevra = resolve_source(args.source, args.no_cache, args.ttl)
+    nevra = resolve_source(args.source)
     if nevra is None:
         print(f"no kernel found for source {args.source}", file=sys.stderr)
         return 2
-    entries = kernel_changelog(nevra.nvr, no_cache=args.no_cache)
+    entries = kernel_changelog(nevra.nvr)
     cves = sorted(cves_in_changelog(entries), reverse=True)
     if args.json:
         print(json.dumps({"source": args.source, "nvr": nevra.nvr, "cves": cves}, indent=2))
@@ -559,9 +502,6 @@ def cmd_cves(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--ttl", type=int, default=DEFAULT_TTL,
-                        help=f"cache TTL in seconds (default {DEFAULT_TTL})")
-    common.add_argument("--no-cache", action="store_true", help="bypass and rewrite cache")
     common.add_argument("--json", action="store_true", help="machine-readable output")
 
     p = argparse.ArgumentParser(

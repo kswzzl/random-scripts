@@ -30,18 +30,23 @@ changelog only carries roughly the last dozen entries), and changelog grep handl
 ## Usage
 
 ```
-c9s-kernel latest                    # show released / gate / pending NVRs
-c9s-kernel check CVE-2024-1086       # verdict per source
-c9s-kernel check CVE-... CVE-... ... # multiple at once
-c9s-kernel changelog --source pending [--limit 5]
-c9s-kernel cves --source pending     # every CVE referenced in that kernel
+python3 c9s_kernel.py latest                    # show released / gate / pending NVRs
+python3 c9s_kernel.py check CVE-2024-1086       # verdict per source
+python3 c9s_kernel.py check CVE-... CVE-... ... # multiple at once
+python3 c9s_kernel.py changelog --source pending [--limit 5]
+python3 c9s_kernel.py cves --source pending     # every CVE referenced in that kernel
 ```
 
 `check` exits 1 if any source comes back NOT PATCHED, so it slots into a cron job or CI alert without extra parsing. Add `--json` to any subcommand for machine-readable output.
 
-## Caching
+## Tests
 
-HTTP fetches and Koji queries get cached under `~/.cache/c9s-kernel/`. Default TTL is one hour. SRPM changelogs are cached for seven days since they're immutable per NVR. `--no-cache` bypasses and overwrites.
+There's a pytest suite covering the pure-logic pieces — RPM version comparison, NEVRA parsing, changelog scanning, and verdict calculation. Network-touching code paths aren't covered (those are exercised by running the CLI itself).
+
+```
+pip install pytest
+pytest
+```
 
 ## Limitations
 
