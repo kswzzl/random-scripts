@@ -1,7 +1,6 @@
 # c9s-kernel
 
-A small CLI for tracking CentOS Stream 9 kernels and figuring out whether a
-given CVE has actually been patched in one of them yet.
+A small CLI for tracking CentOS Stream 9 kernels and figuring out whether a given CVE has actually been patched in one of them yet.
 
 ## Why this exists
 
@@ -15,17 +14,17 @@ There are three places a CentOS Stream 9 kernel can live, in increasing order of
 - **gate** — Koji `c9s-gate` tag. Builds that have passed gating but haven't hit BaseOS yet.
 - **released** — what's actually published in BaseOS at `mirror.stream.centos.org`. This is what `dnf install kernel` would pull.
 
-For each one, the tool decides PATCHED vs NOT PATCHED using two independent signals:
+All comparisons are Stream-vs-Stream. We deliberately don't compare against RHEL fixed NEVRAs — the two distributions use different release-numbering schemes (Stream is `697.el9`, RHEL is `427.13.1.el9_4`), so cross-distribution version comparison gives unreliable answers.
 
-1. **Version comparison against Red Hat's advisory.** Red Hat's security data API publishes a fixed NEVRA per CVE for RHEL 9 (e.g.
-   `kernel-0:5.14.0-427.13.1.el9_4`). If our kernel's release is greater than or equal to that NEVRA, it's patched. The RPM version comparison
-   (`rpmvercmp`) is built in, so you don't need the `rpm` binary on the machine running this.
+For each source, the verdict comes from up to three signals, in priority order:
 
-2. **Changelog grep.** The kernel SRPM changelog is pulled from Koji and searched for the CVE ID. Red Hat writes the CVE ID directly into the
-   changelog entry for the patch, e.g. `... {CVE-2025-68724}`. This catches CVEs that haven't been added to Red Hat's security data API yet, which is the common case for fresh disclosures. If either signal says yes, the verdict is PATCHED. Otherwise NOT PATCHED.
+1. **The source's own changelog mentions the CVE.** Definitive PATCHED. A build's SRPM changelog is exactly the list of patches in that build — if the CVE ID appears, the fix is there. Red Hat writes CVE IDs directly into the entry for the patch, e.g. `... {CVE-2025-68724}`.
 
-The two signals complement each other: version comparison handles old CVEs whose patches have rolled off the visible changelog window (the SRPM
-changelog only carries roughly the last dozen entries), and changelog grep handles brand-new CVEs that Red Hat's API hasn't indexed yet.
+2. **Some other source mentions the CVE, naming the introducer build.** Each kernel changelog entry is headed by the build it landed in, e.g. `[5.14.0-700.el9]`. If pending's changelog mentions CVE-X in the entry for build 700, the fix landed in 700. Compare each source's release against 700: at-or-past → PATCHED, older → NOT PATCHED. This comparison is Stream-vs-Stream and reliable.
+
+3. **Nobody has evidence.** Fall back to a public-date heuristic. Red Hat publishes a `public_date` per CVE; the SRPM changelog has timestamps on each entry. If the CVE went public after our oldest visible changelog entry, we'd have seen the fix if it had landed → NOT PATCHED. If the CVE predates our window, the fix may have rolled off and we genuinely can't tell from this build alone → UNKNOWN.
+
+UNKNOWN is reserved for the third case — when the visible changelog history doesn't reach back far enough to cover the CVE. For old CVEs that need a definitive answer, dump a longer changelog with `c9s_kernel.py changelog` and grep manually, or rely on the fact that Stream lifecycle generally means an old CVE has long since been fixed.
 
 ## Usage
 
@@ -51,8 +50,8 @@ pytest
 ## Limitations
 
 - x86_64 only. The Koji side is arch-independent, so adding aarch64 is mostly a matter of pointing the repodata fetcher at a different mirror path.
-- The version-comparison signal trusts Red Hat's security data API as the canonical fixed NEVRA for RHEL 9. Stream-specific fixes that never made it into RHEL won't have a fixed NEVRA there, so you're relying on changelog grep alone for those.
 - "PATCHED" means the kernel package contains the fix. It does not mean you've installed it on a host. To check a running machine, compare `uname -r` against the `released` NVR.
+- For very old CVEs whose fixes predate every visible changelog window, the verdict is UNKNOWN. The tool intentionally doesn't walk Koji history to find a definitive answer for those — if you need one, dump the changelog with `python3 c9s_kernel.py changelog --source pending` and grep manually.
 
 ## Glossary
 

@@ -44,11 +44,17 @@ REPO_NS = {
 }
 
 CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}")
+INTRODUCER_RE = re.compile(r"\[([^\]]+)\]")
 SOURCES = ("released", "pending", "gate")
 
 
 # --------------------------------------------------------------------------- #
 # RPM version comparison (rpmvercmp algorithm)
+#
+# Used only for Stream-vs-Stream comparison — i.e. comparing one CentOS
+# Stream 9 kernel release against another. Cross-distribution comparison
+# (Stream vs RHEL) would be unreliable because the release-numbering
+# schemes differ; we deliberately don't do that.
 # --------------------------------------------------------------------------- #
 
 def rpmvercmp(a: str, b: str) -> int:
@@ -122,30 +128,31 @@ def rpmvercmp(a: str, b: str) -> int:
     return 1 if i < len(a) else -1
 
 
-def evr_compare(a: tuple[str, str, str], b: tuple[str, str, str]) -> int:
-    ea, va, ra = a
-    eb, vb, rb = b
-    c = rpmvercmp(ea or "0", eb or "0")
+def vr_compare(a: tuple[str, str], b: tuple[str, str]) -> int:
+    """Compare (version, release) tuples."""
+    c = rpmvercmp(a[0], b[0])
     if c:
         return c
-    c = rpmvercmp(va, vb)
-    if c:
-        return c
-    return rpmvercmp(ra, rb)
+    return rpmvercmp(a[1], b[1])
 
 
-def parse_evr(s: str) -> tuple[str, str, str] | None:
-    """Parse 'kernel-0:5.14.0-427.13.1.el9_4' or 'kernel-5.14.0-697.el9' into (E, V, R)."""
-    if "-" not in s:
+def parse_introducer_vr(header: str) -> tuple[str, str] | None:
+    """Pull the trailing '[V-R]' build label off a kernel changelog entry header.
+
+    Kernel SRPM changelog entries are headed by something like
+    `... [5.14.0-700.el9]`. That bracketed token names the build that
+    introduced the entry — i.e. the first build where these patches landed.
+    Returns (version, release) like ('5.14.0', '700.el9'), or None if the
+    header has no such marker.
+    """
+    matches = INTRODUCER_RE.findall(header)
+    if not matches:
         return None
-    _name, rest = s.split("-", 1)
-    epoch = "0"
-    if ":" in rest.split("-", 1)[0]:
-        epoch, rest = rest.split(":", 1)
-    if "-" not in rest:
+    vr = matches[-1].strip()
+    if "-" not in vr:
         return None
-    version, release = rest.rsplit("-", 1)
-    return epoch, version, release
+    version, release = vr.rsplit("-", 1)
+    return version, release
 
 
 # --------------------------------------------------------------------------- #
@@ -288,46 +295,71 @@ def cve_evidence(entries: list[tuple[str, str, int]], cve: str) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
-# Red Hat Security Data
+# Red Hat Security Data — used only for CVE metadata (severity, public date)
 # --------------------------------------------------------------------------- #
 
 def redhat_cve(cve: str) -> dict:
     return json.loads(http_get(REDHAT_CVE_URL.format(cve=cve)))
 
 
-def rhel9_kernel_fix(cve_data: dict) -> dict | None:
-    for rel in cve_data.get("affected_release", []):
-        prod = rel.get("product_name", "")
-        pkg = rel.get("package", "")
-        if "Red Hat Enterprise Linux 9" in prod and pkg.startswith(("kernel-0:", "kernel-")):
-            return rel
-    return None
-
-
 # --------------------------------------------------------------------------- #
 # Verdict
 # --------------------------------------------------------------------------- #
 
-def decide_verdict(version_patched: bool | None,
-                   changelog_evidence: str | None) -> tuple[str, str]:
-    """Return (verdict, reason) for a single (source, CVE) pair.
+def parse_public_date(s: str | None) -> int | None:
+    """Parse a Red Hat public_date ('2024-01-31T00:00:00Z') to epoch seconds."""
+    if not s:
+        return None
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except (ValueError, TypeError):
+        return None
 
-    `version_patched` is True/False if Red Hat has published a RHEL 9 fixed
-    NEVRA we could compare against, None otherwise.
-    `changelog_evidence` is the changelog line that mentions the CVE, or None.
 
-    Verdict is "patched" iff version comparison says we're at or past the
-    fix, or the changelog mentions the CVE. Otherwise "not_patched" — which
-    includes the "no Red Hat record and no changelog mention" case, since
-    the actionable interpretation is "no kernel covers this yet".
+def decide_verdict(source_vr: tuple[str, str],
+                   changelog_evidence: str | None,
+                   introducer_vr: tuple[str, str] | None,
+                   public_date_epoch: int | None,
+                   oldest_entry_epoch: int | None) -> tuple[str, str]:
+    """Stream-only verdict for one (source, CVE) pair.
+
+    Three signals, in priority order:
+
+    1. The source's own changelog mentions the CVE → definitive PATCHED.
+       A build's changelog is exactly its patch history.
+
+    2. Some other source's changelog mentions the CVE, naming the
+       introducer build. Compare our build's release against the
+       introducer (Stream-vs-Stream — apples to apples). Older than the
+       introducer → NOT PATCHED. At or past it → PATCHED (fix has rolled
+       off our visible window but we still have the build that contains it).
+
+    3. Nobody has evidence. Fall back to a public-date heuristic: if the
+       CVE went public after our oldest changelog entry, we'd have seen
+       the fix if it had landed → NOT PATCHED. If the CVE predates our
+       window, the fix may have rolled off and we can't tell → UNKNOWN.
     """
-    if version_patched is True:
-        return "patched", "kernel >= RHEL9 fix"
     if changelog_evidence:
-        return "patched", "backport in changelog"
-    if version_patched is False:
-        return "not_patched", "kernel older than RHEL9 fix"
-    return "not_patched", "no fix in changelog or Red Hat data"
+        return "patched", "fix in changelog"
+
+    if introducer_vr is not None:
+        cmp = vr_compare(source_vr, introducer_vr)
+        introducer_label = f"{introducer_vr[0]}-{introducer_vr[1]}"
+        if cmp >= 0:
+            return "patched", f"build at or past introducer {introducer_label}"
+        return "not_patched", f"build older than introducer {introducer_label}"
+
+    if public_date_epoch is None or oldest_entry_epoch is None:
+        return "not_patched", "no fix in changelog"
+
+    if public_date_epoch >= oldest_entry_epoch:
+        return "not_patched", "no fix in changelog (CVE public after oldest entry)"
+
+    return "unknown", "fix predates visible changelog window"
 
 
 # --------------------------------------------------------------------------- #
@@ -365,6 +397,17 @@ def cmd_latest(args) -> int:
     return 0
 
 
+def _evidence_and_introducer(entries: list[tuple[str, str, int]],
+                             cve: str) -> tuple[str | None, tuple[str, str] | None]:
+    """Find (line that mentions CVE, introducer V-R from that entry's header)."""
+    for header, body, _t in entries:
+        if cve not in body:
+            continue
+        line = next((ln.strip() for ln in body.splitlines() if cve in ln), None)
+        return line, parse_introducer_vr(header)
+    return None, None
+
+
 def cmd_check(args) -> int:
     findings: list[dict] = []
     for raw in args.cve:
@@ -374,20 +417,21 @@ def cmd_check(args) -> int:
             continue
         result: dict = {"cve": cve, "sources": {}, "redhat": None}
 
-        rh_fix_evr: tuple[str, str, str] | None = None
+        public_date_epoch: int | None = None
         try:
             data = redhat_cve(cve)
-            fix = rhel9_kernel_fix(data)
-            rh_fix_evr = parse_evr(fix["package"]) if fix and fix.get("package") else None
             result["redhat"] = {
                 "severity": data.get("threat_severity"),
                 "public_date": data.get("public_date"),
-                "rhel9_fix": fix.get("package") if fix else None,
-                "rhel9_release_date": fix.get("release_date") if fix else None,
             }
+            public_date_epoch = parse_public_date(data.get("public_date"))
         except Exception as e:
             result["redhat"] = {"error": str(e)}
 
+        # Pass 1: fetch each source's NEVRA + changelog. Look for evidence
+        # in each. If any source has evidence, parse the introducer V-R
+        # from its entry header — that's the build that introduced the fix.
+        introducer_vr: tuple[str, str] | None = None
         for src in SOURCES:
             try:
                 nevra = resolve_source(src)
@@ -398,26 +442,37 @@ def cmd_check(args) -> int:
                 result["sources"][src] = {"nvr": None, "verdict": None}
                 continue
 
-            entry: dict = {"nvr": nevra.nvr}
-            if rh_fix_evr is not None:
-                our_evr = (nevra.epoch, nevra.version, nevra.release)
-                cmp = evr_compare(our_evr, rh_fix_evr)
-                entry["version_patched"] = cmp >= 0
-                entry["version_cmp"] = cmp
-            else:
-                entry["version_patched"] = None
-
+            entry: dict = {"nvr": nevra.nvr,
+                           "_nevra": nevra}  # carried through pass 2, dropped before output
             try:
                 entries = kernel_changelog(nevra.nvr)
-                entry["changelog_evidence"] = cve_evidence(entries, cve)
+                evidence, src_introducer = _evidence_and_introducer(entries, cve)
+                entry["changelog_evidence"] = evidence
+                entry["oldest_entry_epoch"] = (
+                    min(t for _n, _b, t in entries) if entries else None
+                )
+                if src_introducer is not None and introducer_vr is None:
+                    introducer_vr = src_introducer
             except Exception as e:
                 entry["changelog_error"] = str(e)
                 entry["changelog_evidence"] = None
+                entry["oldest_entry_epoch"] = None
 
-            entry["verdict"], entry["reason"] = decide_verdict(
-                entry["version_patched"], entry["changelog_evidence"]
-            )
             result["sources"][src] = entry
+
+        # Pass 2: decide verdict per source using own evidence + cross-source introducer.
+        for src in SOURCES:
+            entry = result["sources"].get(src) or {}
+            nevra = entry.pop("_nevra", None)
+            if nevra is None or "verdict" in entry or "error" in entry:
+                continue
+            entry["verdict"], entry["reason"] = decide_verdict(
+                source_vr=(nevra.version, nevra.release),
+                changelog_evidence=entry["changelog_evidence"],
+                introducer_vr=introducer_vr,
+                public_date_epoch=public_date_epoch,
+                oldest_entry_epoch=entry["oldest_entry_epoch"],
+            )
 
         findings.append(result)
 
@@ -433,12 +488,6 @@ def cmd_check(args) -> int:
                 public = (rh.get("public_date") or "?")[:10]
                 print(f"  Severity:    {rh.get('severity') or '?'}")
                 print(f"  Public date: {public}")
-                fix = rh.get("rhel9_fix")
-                if fix:
-                    rel = (rh.get("rhel9_release_date") or "?")[:10]
-                    print(f"  RHEL9 fix:   {fix}  (released {rel})")
-                else:
-                    print(f"  RHEL9 fix:   (not yet listed by Red Hat)")
             print()
             for src in SOURCES:
                 s = f["sources"].get(src, {})
@@ -448,7 +497,11 @@ def cmd_check(args) -> int:
                 if s.get("nvr") is None:
                     print(f"  {src:10s} (no kernel found)")
                     continue
-                label = "PATCHED" if s["verdict"] == "patched" else "NOT PATCHED"
+                label = {
+                    "patched": "PATCHED",
+                    "not_patched": "NOT PATCHED",
+                    "unknown": "UNKNOWN",
+                }[s["verdict"]]
                 reason = s.get("reason", "")
                 print(f"  {src:10s} {label:12s} {reason}")
                 ev = s.get("changelog_evidence")
