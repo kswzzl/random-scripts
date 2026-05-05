@@ -3,8 +3,8 @@
 c9s-kernel — Track CentOS Stream 9 kernel availability and CVE patch status.
 
 Subcommands:
-    latest                       Show newest kernel NEVRAs across released / pending / gate.
-    check CVE-YYYY-NNNNN [...]   Report which sources have changelog evidence of the fix.
+    latest                       Show newest kernel NVRs across released / pending / gate.
+    check CVE-YYYY-NNNNN [...]   Verdict per source.
     changelog [--source SRC]     Dump the kernel changelog for a given source.
     cves      [--source SRC]     List every CVE referenced in a kernel's changelog.
 
@@ -31,133 +31,40 @@ import urllib.request
 import xml.etree.ElementTree as ET
 import xmlrpc.client
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 REPO_BASE = "https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os"
 KOJI_URL = "https://kojihub.stream.centos.org/kojihub"
 REDHAT_CVE_URL = "https://access.redhat.com/hydra/rest/securitydata/cve/{cve}.json"
 
 USER_AGENT = "c9s-kernel/0.1"
-
-REPO_NS = {
-    "r": "http://linux.duke.edu/metadata/repo",
-    "c": "http://linux.duke.edu/metadata/common",
-}
+COMMON_NS = "http://linux.duke.edu/metadata/common"
+REPO_NS = "http://linux.duke.edu/metadata/repo"
 
 CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}")
-INTRODUCER_RE = re.compile(r"\[([^\]]+)\]")
+# Match the build-counter integer from a kernel changelog entry header
+# like '... [5.14.0-700.el9]'. Stream 9 kernels are always integer + .el9.
+INTRODUCER_RE = re.compile(r"-(\d+)\.el9")
+
 SOURCES = ("released", "pending", "gate")
 
 
 # --------------------------------------------------------------------------- #
-# RPM version comparison (rpmvercmp algorithm)
-#
-# Used only for Stream-vs-Stream comparison — i.e. comparing one CentOS
-# Stream 9 kernel release against another. Cross-distribution comparison
-# (Stream vs RHEL) would be unreliable because the release-numbering
-# schemes differ; we deliberately don't do that.
+# Helpers
 # --------------------------------------------------------------------------- #
 
-def rpmvercmp(a: str, b: str) -> int:
-    """Compare two RPM version/release strings. Returns -1 / 0 / 1."""
-    if a == b:
-        return 0
-    i = j = 0
-    while i < len(a) and j < len(b):
-        if a[i] == "~" or b[j] == "~":
-            if a[i] != "~":
-                return 1
-            if b[j] != "~":
-                return -1
-            i += 1
-            j += 1
-            continue
-        if a[i] == "^" or b[j] == "^":
-            if i == len(a):
-                return -1
-            if j == len(b):
-                return 1
-            if a[i] != "^":
-                return 1
-            if b[j] != "^":
-                return -1
-            i += 1
-            j += 1
-            continue
-        if not a[i].isalnum():
-            i += 1
-            continue
-        if not b[j].isalnum():
-            j += 1
-            continue
-        if a[i].isdigit():
-            ma = re.match(r"\d+", a[i:])
-            seg_a = ma.group(0)
-            i += len(seg_a)
-            isnum_a = True
-        else:
-            ma = re.match(r"[A-Za-z]+", a[i:])
-            seg_a = ma.group(0)
-            i += len(seg_a)
-            isnum_a = False
-        if b[j].isdigit():
-            mb = re.match(r"\d+", b[j:])
-            seg_b = mb.group(0)
-            j += len(seg_b)
-            isnum_b = True
-        else:
-            mb = re.match(r"[A-Za-z]+", b[j:])
-            seg_b = mb.group(0)
-            j += len(seg_b)
-            isnum_b = False
-        if isnum_a and not isnum_b:
-            return 1
-        if not isnum_a and isnum_b:
-            return -1
-        if isnum_a:
-            seg_a = seg_a.lstrip("0") or "0"
-            seg_b = seg_b.lstrip("0") or "0"
-            if len(seg_a) != len(seg_b):
-                return 1 if len(seg_a) > len(seg_b) else -1
-        if seg_a != seg_b:
-            return 1 if seg_a > seg_b else -1
-    if i == len(a) and j == len(b):
-        return 0
-    rem = a[i:] if i < len(a) else b[j:]
-    if rem.startswith("~"):
-        return -1 if i < len(a) else 1
-    return 1 if i < len(a) else -1
+@dataclass
+class Kernel:
+    version: str
+    release: str
 
+    @property
+    def nvr(self) -> str:
+        return f"kernel-{self.version}-{self.release}"
 
-def vr_compare(a: tuple[str, str], b: tuple[str, str]) -> int:
-    """Compare (version, release) tuples."""
-    c = rpmvercmp(a[0], b[0])
-    if c:
-        return c
-    return rpmvercmp(a[1], b[1])
+    def __str__(self) -> str:
+        return self.nvr
 
-
-def parse_introducer_vr(header: str) -> tuple[str, str] | None:
-    """Pull the trailing '[V-R]' build label off a kernel changelog entry header.
-
-    Kernel SRPM changelog entries are headed by something like
-    `... [5.14.0-700.el9]`. That bracketed token names the build that
-    introduced the entry — i.e. the first build where these patches landed.
-    Returns (version, release) like ('5.14.0', '700.el9'), or None if the
-    header has no such marker.
-    """
-    matches = INTRODUCER_RE.findall(header)
-    if not matches:
-        return None
-    vr = matches[-1].strip()
-    if "-" not in vr:
-        return None
-    version, release = vr.rsplit("-", 1)
-    return version, release
-
-
-# --------------------------------------------------------------------------- #
-# HTTP
-# --------------------------------------------------------------------------- #
 
 def http_get(url: str) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -165,74 +72,68 @@ def http_get(url: str) -> bytes:
         return resp.read()
 
 
-# --------------------------------------------------------------------------- #
-# NEVRA
-# --------------------------------------------------------------------------- #
+def release_counter(release: str) -> int | None:
+    """Pull the leading integer build counter out of a release string like '700.el9'."""
+    m = re.match(r"\d+", release)
+    return int(m.group(0)) if m else None
 
-@dataclass
-class Nevra:
-    name: str
-    epoch: str
-    version: str
-    release: str
 
-    @property
-    def nvr(self) -> str:
-        return f"{self.name}-{self.version}-{self.release}"
+def parse_introducer(header: str) -> int | None:
+    """Pull the build counter from a changelog entry header's '[V-N.el9]' label."""
+    m = INTRODUCER_RE.search(header)
+    return int(m.group(1)) if m else None
 
-    def __str__(self) -> str:
-        e = f"{self.epoch}:" if self.epoch and self.epoch != "0" else ""
-        return f"{self.name}-{e}{self.version}-{self.release}"
+
+def parse_public_date(s: str | None) -> int | None:
+    """Parse Red Hat's ISO-8601 public_date to epoch seconds."""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except (ValueError, TypeError):
+        return None
 
 
 # --------------------------------------------------------------------------- #
 # Released kernel: BaseOS repodata
 # --------------------------------------------------------------------------- #
 
-def _primary_href(repomd: ET.Element) -> str:
-    for d in repomd.findall("r:data", REPO_NS):
+def latest_released_kernel() -> Kernel:
+    repomd = ET.fromstring(http_get(f"{REPO_BASE}/repodata/repomd.xml"))
+    href = None
+    for d in repomd.findall(f"{{{REPO_NS}}}data"):
         if d.get("type") == "primary":
-            loc = d.find("r:location", REPO_NS)
-            if loc is not None and loc.get("href"):
-                return loc.get("href")  # type: ignore[return-value]
-    raise RuntimeError("primary data block not found in repomd.xml")
+            loc = d.find(f"{{{REPO_NS}}}location")
+            href = loc.get("href") if loc is not None else None
+    if href is None:
+        raise RuntimeError("primary data block not found in repomd.xml")
 
+    xml_bytes = gzip.decompress(http_get(f"{REPO_BASE}/{href}"))
+    pkg_tag = f"{{{COMMON_NS}}}package"
 
-def latest_released_kernel() -> Nevra:
-    repomd_raw = http_get(f"{REPO_BASE}/repodata/repomd.xml")
-    href = _primary_href(ET.fromstring(repomd_raw))
-    primary_gz = http_get(f"{REPO_BASE}/{href}")
-    xml_bytes = gzip.decompress(primary_gz)
-
-    pkg_tag = f"{{{REPO_NS['c']}}}package"
-    name_tag = f"{{{REPO_NS['c']}}}name"
-    arch_tag = f"{{{REPO_NS['c']}}}arch"
-    ver_tag = f"{{{REPO_NS['c']}}}version"
-    time_tag = f"{{{REPO_NS['c']}}}time"
-
-    best: Nevra | None = None
+    best: Kernel | None = None
     best_buildtime = -1
-
     for _ev, elem in ET.iterparse(io.BytesIO(xml_bytes), events=("end",)):
         if elem.tag != pkg_tag:
             continue
-        name_el = elem.find(name_tag)
-        arch_el = elem.find(arch_tag)
+        name_el = elem.find(f"{{{COMMON_NS}}}name")
+        arch_el = elem.find(f"{{{COMMON_NS}}}arch")
         if (name_el is None or name_el.text != "kernel"
                 or arch_el is None or arch_el.text != "x86_64"):
             elem.clear()
             continue
-        ver = elem.find(ver_tag)
-        bt = elem.find(time_tag)
+        ver = elem.find(f"{{{COMMON_NS}}}version")
+        bt = elem.find(f"{{{COMMON_NS}}}time")
         buildtime = int(bt.get("build", "0")) if bt is not None else 0
-        nevra = Nevra(
-            name="kernel",
-            epoch=ver.get("epoch", "0") if ver is not None else "0",
+        k = Kernel(
             version=ver.get("ver", "") if ver is not None else "",
             release=ver.get("rel", "") if ver is not None else "",
         )
         if buildtime > best_buildtime:
-            best, best_buildtime = nevra, buildtime
+            best, best_buildtime = k, buildtime
         elem.clear()
 
     if best is None:
@@ -248,21 +149,16 @@ def _koji() -> xmlrpc.client.ServerProxy:
     return xmlrpc.client.ServerProxy(KOJI_URL, allow_none=True)
 
 
-def latest_tagged_kernel(tag: str) -> Nevra | None:
+def latest_tagged_kernel(tag: str) -> Kernel | None:
     builds = _koji().getLatestBuilds(tag, None, "kernel")
     if not builds:
         return None
     b = builds[0]
-    return Nevra(
-        name=b["name"],
-        epoch=str(b.get("epoch") or "0"),
-        version=b["version"],
-        release=b["release"],
-    )
+    return Kernel(version=b["version"], release=b["release"])
 
 
 def kernel_changelog(nvr: str) -> list[tuple[str, str, int]]:
-    """Return [(header, body, epoch_seconds), ...] newest first, from Koji SRPM headers."""
+    """Return [(header, body, epoch_seconds), ...] newest first, from the SRPM headers."""
     s = _koji()
     build = s.getBuild(nvr)
     if not build:
@@ -271,32 +167,39 @@ def kernel_changelog(nvr: str) -> list[tuple[str, str, int]]:
     if not srpms:
         raise RuntimeError(f"build {nvr} has no SRPM listed")
     hdrs = s.getRPMHeaders(srpms[0]["id"], ["changelogtime", "changelogname", "changelogtext"])
-    names = hdrs.get("CHANGELOGNAME") or []
-    texts = hdrs.get("CHANGELOGTEXT") or []
-    times = hdrs.get("CHANGELOGTIME") or []
-    return list(zip(names, texts, times))
+    return list(zip(
+        hdrs.get("CHANGELOGNAME") or [],
+        hdrs.get("CHANGELOGTEXT") or [],
+        hdrs.get("CHANGELOGTIME") or [],
+    ))
 
 
 def cves_in_changelog(entries: list[tuple[str, str, int]]) -> set[str]:
     found: set[str] = set()
-    for _name, body, _t in entries:
+    for _h, body, _t in entries:
         found.update(CVE_RE.findall(body))
     return found
 
 
 def cve_evidence(entries: list[tuple[str, str, int]], cve: str) -> str | None:
-    """First line in the changelog that mentions the CVE, if any."""
-    for _name, body, _t in entries:
-        if cve in body:
-            for line in body.splitlines():
-                if cve in line:
-                    return line.strip()
+    """First line in any entry that mentions the CVE."""
+    for _h, body, _t in entries:
+        for line in body.splitlines():
+            if cve in line:
+                return line.strip()
     return None
 
 
-# --------------------------------------------------------------------------- #
-# Red Hat Security Data — used only for CVE metadata (severity, public date)
-# --------------------------------------------------------------------------- #
+def evidence_and_introducer(entries: list[tuple[str, str, int]],
+                            cve: str) -> tuple[str | None, int | None]:
+    """Find (evidence line, introducer build counter) for the CVE in this changelog."""
+    for header, body, _t in entries:
+        if cve not in body:
+            continue
+        line = next((ln.strip() for ln in body.splitlines() if cve in ln), None)
+        return line, parse_introducer(header)
+    return None, None
+
 
 def redhat_cve(cve: str) -> dict:
     return json.loads(http_get(REDHAT_CVE_URL.format(cve=cve)))
@@ -306,52 +209,19 @@ def redhat_cve(cve: str) -> dict:
 # Verdict
 # --------------------------------------------------------------------------- #
 
-def parse_public_date(s: str | None) -> int | None:
-    """Parse a Red Hat public_date ('2024-01-31T00:00:00Z') to epoch seconds."""
-    if not s:
-        return None
-    try:
-        from datetime import datetime, timezone
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp())
-    except (ValueError, TypeError):
-        return None
-
-
-def decide_verdict(source_vr: tuple[str, str],
+def decide_verdict(source_release: int | None,
                    changelog_evidence: str | None,
-                   introducer_vr: tuple[str, str] | None,
+                   introducer_release: int | None,
                    public_date_epoch: int | None,
                    oldest_entry_epoch: int | None) -> tuple[str, str]:
-    """Stream-only verdict for one (source, CVE) pair.
-
-    Three signals, in priority order:
-
-    1. The source's own changelog mentions the CVE → definitive PATCHED.
-       A build's changelog is exactly its patch history.
-
-    2. Some other source's changelog mentions the CVE, naming the
-       introducer build. Compare our build's release against the
-       introducer (Stream-vs-Stream — apples to apples). Older than the
-       introducer → NOT PATCHED. At or past it → PATCHED (fix has rolled
-       off our visible window but we still have the build that contains it).
-
-    3. Nobody has evidence. Fall back to a public-date heuristic: if the
-       CVE went public after our oldest changelog entry, we'd have seen
-       the fix if it had landed → NOT PATCHED. If the CVE predates our
-       window, the fix may have rolled off and we can't tell → UNKNOWN.
-    """
+    """Stream-only verdict. See README for the signal priority."""
     if changelog_evidence:
         return "patched", "fix in changelog"
 
-    if introducer_vr is not None:
-        cmp = vr_compare(source_vr, introducer_vr)
-        introducer_label = f"{introducer_vr[0]}-{introducer_vr[1]}"
-        if cmp >= 0:
-            return "patched", f"build at or past introducer {introducer_label}"
-        return "not_patched", f"build older than introducer {introducer_label}"
+    if introducer_release is not None and source_release is not None:
+        if source_release >= introducer_release:
+            return "patched", f"build at or past introducer 5.14.0-{introducer_release}.el9"
+        return "not_patched", f"build older than introducer 5.14.0-{introducer_release}.el9"
 
     if public_date_epoch is None or oldest_entry_epoch is None:
         return "not_patched", "no fix in changelog"
@@ -366,7 +236,7 @@ def decide_verdict(source_vr: tuple[str, str],
 # Source dispatch
 # --------------------------------------------------------------------------- #
 
-def resolve_source(source: str) -> Nevra | None:
+def resolve_source(source: str) -> Kernel | None:
     if source == "released":
         return latest_released_kernel()
     if source == "pending":
@@ -384,28 +254,16 @@ def cmd_latest(args) -> int:
     out: dict[str, str | None] = {}
     for src in SOURCES:
         try:
-            n = resolve_source(src)
-            out[src] = str(n) if n else None
+            k = resolve_source(src)
+            out[src] = str(k) if k else None
         except Exception as e:
             out[src] = f"<error: {e}>"
     if args.json:
         print(json.dumps(out, indent=2))
     else:
-        w = max(len(s) for s in SOURCES)
         for s in SOURCES:
-            print(f"{s.ljust(w)}  {out[s] or '(none)'}")
+            print(f"{s:9s} {out[s] or '(none)'}")
     return 0
-
-
-def _evidence_and_introducer(entries: list[tuple[str, str, int]],
-                             cve: str) -> tuple[str | None, tuple[str, str] | None]:
-    """Find (line that mentions CVE, introducer V-R from that entry's header)."""
-    for header, body, _t in entries:
-        if cve not in body:
-            continue
-        line = next((ln.strip() for ln in body.splitlines() if cve in ln), None)
-        return line, parse_introducer_vr(header)
-    return None, None
 
 
 def cmd_check(args) -> int:
@@ -428,48 +286,43 @@ def cmd_check(args) -> int:
         except Exception as e:
             result["redhat"] = {"error": str(e)}
 
-        # Pass 1: fetch each source's NEVRA + changelog. Look for evidence
-        # in each. If any source has evidence, parse the introducer V-R
-        # from its entry header — that's the build that introduced the fix.
-        introducer_vr: tuple[str, str] | None = None
+        # Pass 1: collect each source's data and any introducer we can spot.
+        introducer: int | None = None
         for src in SOURCES:
             try:
-                nevra = resolve_source(src)
+                kernel = resolve_source(src)
             except Exception as e:
                 result["sources"][src] = {"error": f"resolve: {e}"}
                 continue
-            if nevra is None:
-                result["sources"][src] = {"nvr": None, "verdict": None}
+            if kernel is None:
+                result["sources"][src] = {"nvr": None}
                 continue
 
-            entry: dict = {"nvr": nevra.nvr,
-                           "_nevra": nevra}  # carried through pass 2, dropped before output
+            entry: dict = {"nvr": kernel.nvr, "_release": release_counter(kernel.release)}
             try:
-                entries = kernel_changelog(nevra.nvr)
-                evidence, src_introducer = _evidence_and_introducer(entries, cve)
+                entries = kernel_changelog(kernel.nvr)
+                evidence, src_introducer = evidence_and_introducer(entries, cve)
                 entry["changelog_evidence"] = evidence
                 entry["oldest_entry_epoch"] = (
-                    min(t for _n, _b, t in entries) if entries else None
+                    min(t for _h, _b, t in entries) if entries else None
                 )
-                if src_introducer is not None and introducer_vr is None:
-                    introducer_vr = src_introducer
+                if src_introducer is not None and introducer is None:
+                    introducer = src_introducer
             except Exception as e:
                 entry["changelog_error"] = str(e)
                 entry["changelog_evidence"] = None
                 entry["oldest_entry_epoch"] = None
-
             result["sources"][src] = entry
 
-        # Pass 2: decide verdict per source using own evidence + cross-source introducer.
+        # Pass 2: decide each source's verdict using the introducer + own evidence.
         for src in SOURCES:
             entry = result["sources"].get(src) or {}
-            nevra = entry.pop("_nevra", None)
-            if nevra is None or "verdict" in entry or "error" in entry:
+            if "error" in entry or entry.get("nvr") is None:
                 continue
             entry["verdict"], entry["reason"] = decide_verdict(
-                source_vr=(nevra.version, nevra.release),
+                source_release=entry.pop("_release"),
                 changelog_evidence=entry["changelog_evidence"],
-                introducer_vr=introducer_vr,
+                introducer_release=introducer,
                 public_date_epoch=public_date_epoch,
                 oldest_entry_epoch=entry["oldest_entry_epoch"],
             )
@@ -485,9 +338,8 @@ def cmd_check(args) -> int:
             if "error" in rh:
                 print(f"  Red Hat:   error: {rh['error']}")
             else:
-                public = (rh.get("public_date") or "?")[:10]
                 print(f"  Severity:    {rh.get('severity') or '?'}")
-                print(f"  Public date: {public}")
+                print(f"  Public date: {(rh.get('public_date') or '?')[:10]}")
             print()
             for src in SOURCES:
                 s = f["sources"].get(src, {})
@@ -497,16 +349,12 @@ def cmd_check(args) -> int:
                 if s.get("nvr") is None:
                     print(f"  {src:10s} (no kernel found)")
                     continue
-                label = {
-                    "patched": "PATCHED",
-                    "not_patched": "NOT PATCHED",
-                    "unknown": "UNKNOWN",
-                }[s["verdict"]]
-                reason = s.get("reason", "")
-                print(f"  {src:10s} {label:12s} {reason}")
-                ev = s.get("changelog_evidence")
-                if ev:
-                    print(f"             evidence: {ev}")
+                label = {"patched": "PATCHED",
+                         "not_patched": "NOT PATCHED",
+                         "unknown": "UNKNOWN"}[s["verdict"]]
+                print(f"  {src:10s} {label:12s} {s.get('reason', '')}")
+                if s.get("changelog_evidence"):
+                    print(f"             evidence: {s['changelog_evidence']}")
             print()
 
     any_not_patched = any(
@@ -518,32 +366,28 @@ def cmd_check(args) -> int:
 
 
 def cmd_changelog(args) -> int:
-    nevra = resolve_source(args.source)
-    if nevra is None:
+    kernel = resolve_source(args.source)
+    if kernel is None:
         print(f"no kernel found for source {args.source}", file=sys.stderr)
         return 2
-    entries = kernel_changelog(nevra.nvr)
-    print(f"# {nevra} — {len(entries)} changelog entries")
-    print()
-    shown = entries[: args.limit] if args.limit else entries
-    for name, body, _t in shown:
-        print(f"* {name}")
-        print(body)
-        print()
+    entries = kernel_changelog(kernel.nvr)
+    print(f"# {kernel} — {len(entries)} changelog entries\n")
+    for header, body, _t in (entries[: args.limit] if args.limit else entries):
+        print(f"* {header}\n{body}\n")
     return 0
 
 
 def cmd_cves(args) -> int:
-    nevra = resolve_source(args.source)
-    if nevra is None:
+    kernel = resolve_source(args.source)
+    if kernel is None:
         print(f"no kernel found for source {args.source}", file=sys.stderr)
         return 2
-    entries = kernel_changelog(nevra.nvr)
+    entries = kernel_changelog(kernel.nvr)
     cves = sorted(cves_in_changelog(entries), reverse=True)
     if args.json:
-        print(json.dumps({"source": args.source, "nvr": nevra.nvr, "cves": cves}, indent=2))
+        print(json.dumps({"source": args.source, "nvr": kernel.nvr, "cves": cves}, indent=2))
     else:
-        print(f"# {len(cves)} CVEs referenced in {nevra} changelog")
+        print(f"# {len(cves)} CVEs referenced in {kernel} changelog")
         for c in cves:
             print(c)
     return 0
@@ -557,25 +401,22 @@ def main(argv: list[str] | None = None) -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", help="machine-readable output")
 
-    p = argparse.ArgumentParser(
-        prog="c9s-kernel",
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        parents=[common],
-    )
-
+    p = argparse.ArgumentParser(prog="c9s-kernel", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter,
+                                parents=[common])
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("latest", parents=[common],
-                        help="show newest kernel across released/pending/gate")
-    sp.set_defaults(func=cmd_latest)
+    sub.add_parser("latest", parents=[common],
+                   help="show newest kernel across released/pending/gate"
+                   ).set_defaults(func=cmd_latest)
 
     sp = sub.add_parser("check", parents=[common],
-                        help="check whether CVEs are mentioned in each source's changelog")
+                        help="verdict per source for one or more CVEs")
     sp.add_argument("cve", nargs="+", help="one or more CVE IDs (e.g. CVE-2024-1086)")
     sp.set_defaults(func=cmd_check)
 
-    sp = sub.add_parser("changelog", parents=[common], help="dump kernel changelog for a source")
+    sp = sub.add_parser("changelog", parents=[common],
+                        help="dump kernel changelog for a source")
     sp.add_argument("--source", choices=SOURCES, default="released")
     sp.add_argument("--limit", type=int, default=0, help="show only the first N entries")
     sp.set_defaults(func=cmd_changelog)

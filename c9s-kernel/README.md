@@ -1,20 +1,18 @@
 # c9s-kernel
 
-CLI for tracking CentOS Stream 9 kernels and checking whether a given CVE has been patched in one of them.
+Tool for tracking CentOS Stream 9 kernels and checking whether a given CVE has been patched in one of them.
 
 When a kernel CVE drops, the question I want answered is "is there a Stream 9 kernel I can install that fixes this?", not "what's the latest kernel version?". Those are different questions. This wraps a few data sources so I can ask the real one.
 
-## What a kernel version actually is
-
-The kernel is the bottom layer of the OS, the thing that talks to your hardware. Every distro ships its own. They mostly start from the same upstream Linux source but build it differently.
+## What a CentOS kernel version actually is
 
 A version like `kernel-5.14.0-700.el9` packs three things into one string:
 
-- `5.14.0` is the upstream version, what Linus tagged in the upstream Git tree years ago.
+- `5.14.0` is the upstream Linux version
 - `700` is the release number. Red Hat's internal counter of how many times they've rebuilt this kernel with new patches. It only goes up.
 - `el9` is the dist tag. Says "this is for the Enterprise Linux 9 family".
 
-The upstream version barely changes. Red Hat picked `5.14.0` at the start of EL9 and they're sticking with it for the entire EL9 lifecycle. Instead of rebasing onto newer upstream kernels they backport fixes into this old one. So the release number is the thing that moves. Build 700 has more patches than 697, which has more than 690. That's the axis you care about.
+The upstream version barely changes. Red Hat picked `5.14.0` at the start of EL9 and they're sticking with it for the entire EL9 lifecycle. Instead of rebasing onto newer upstream kernels they backport fixes into this old one.
 
 ## Stream isn't the same as RHEL
 
@@ -38,7 +36,7 @@ That's why this tool is Stream-only. If you tried to compare across distros, the
 2. `gate`. Builds that have passed automated testing. A bit older than pending, a bit newer than released.
 3. `released`. What's actually published in the BaseOS repo. This is what `dnf install kernel` would pull onto a real server.
 
-To answer those, the tool talks to Koji (Red Hat's build system, basically a factory floor with a public API). It asks what's in the pending and gate tags, and reads the BaseOS repo metadata for what's released. That's what the `latest` subcommand reports.
+To answer those, the tool talks to Koji (Red Hat's build system). It asks what's in the pending and gate tags, and reads the BaseOS repo metadata for what's released. That's what the `latest` subcommand reports.
 
 ## What we're actually trying to answer
 
@@ -46,11 +44,11 @@ When a CVE drops you want to know: is there a Stream 9 kernel I can install that
 
 Two pieces of evidence to work with:
 
-One, the kernel's changelog. Every Stream kernel package ships with a build log: a list of patches added in each build. When Red Hat backports a CVE fix they write the CVE ID right into the changelog line, like `... {CVE-2025-68724}`. So if you see the CVE in build 700's changelog, build 700 has the fix. Definitive.
+First, the kernel's changelog. Every Stream kernel package ships with a build log: a list of patches added in each build. When Red Hat backports a CVE fix they write the CVE ID right into the changelog line, like `... {CVE-2025-68724}`. So if you see the CVE in build 700's changelog, build 700 has the fix. Definitive.
 
 The catch is that the changelog only keeps the last dozen or so entries. Older patches roll off. A CVE patched a year ago might not appear in a current build's changelog even though the fix is absolutely still in the kernel.
 
-Two, Red Hat's CVE database. A JSON record per CVE. Severity, public date, that sort of thing. Useful as metadata. Red Hat also lists "this CVE is fixed in package X", but X is a RHEL package, which we already said we can't compare against Stream. So we ignore that field and only pull severity and date out.
+Second, Red Hat's CVE database. A JSON record per CVE. Severity, public date, that sort of thing. Useful as metadata. Red Hat also lists "this CVE is fixed in package X", but X is a RHEL package, which we already said we can't compare against Stream. So we ignore that field and only pull severity and date out.
 
 ## How the verdict gets made
 
