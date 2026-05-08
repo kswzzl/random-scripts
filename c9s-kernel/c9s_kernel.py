@@ -288,6 +288,7 @@ def cmd_check(args) -> int:
 
         # Pass 1: collect each source's data and any introducer we can spot.
         introducer: int | None = None
+        result["fixed_in"] = None  # filled in once we know the introducer
         for src in SOURCES:
             try:
                 kernel = resolve_source(src)
@@ -327,6 +328,9 @@ def cmd_check(args) -> int:
                 oldest_entry_epoch=entry["oldest_entry_epoch"],
             )
 
+        if introducer is not None:
+            result["fixed_in"] = f"kernel-5.14.0-{introducer}.el9"
+
         findings.append(result)
 
     if args.json:
@@ -340,6 +344,7 @@ def cmd_check(args) -> int:
             else:
                 print(f"  Severity:    {rh.get('severity') or '?'}")
                 print(f"  Public date: {(rh.get('public_date') or '?')[:10]}")
+            print(f"  Fixed in:    {f.get('fixed_in') or '(unknown — fix not visible in any changelog)'}")
             print()
             for src in SOURCES:
                 s = f["sources"].get(src, {})
